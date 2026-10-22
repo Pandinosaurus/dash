@@ -1,9 +1,16 @@
 # -*- coding: utf-8 -*-
 
+from selenium.webdriver.common.by import By
+
+import dash.testing.wait as wait
 from dash import Dash, Input, Output, dcc, html
 
 
 md_text = """```python
+print('hello, world!')
+```"""
+
+new_md_text = """```python
 import dash
 print('hello, world!')
 ```"""
@@ -44,5 +51,44 @@ def test_msmh002_window_override(dash_dcc):
 
     dash_dcc.find_element("#md-trigger").click()
     dash_dcc.wait_for_text_to_equal("#md-container code", "hljs override")
+
+    assert dash_dcc.get_logs() == []
+
+
+def test_msmh003_update_md(dash_dcc):
+    app = Dash(__name__)
+    app.layout = html.Div(
+        [
+            html.Button("Click", id="md-trigger"),
+            dcc.Markdown(md_text, id="md"),
+        ]
+    )
+
+    @app.callback(Output("md", "children"), [Input("md-trigger", "n_clicks")])
+    def update_md(nclicks):
+        if nclicks is not None and nclicks > 0:
+            return new_md_text
+        return md_text
+
+    dash_dcc.start_server(app)
+
+    # a highlighted node will have <span> children which are what color the text
+    code = dash_dcc.wait_for_element("code[data-highlighted='yes']")
+    assert len(code.find_elements(By.TAG_NAME, "span")) == 2
+
+    dash_dcc.find_element("#md-trigger").click()
+
+    # The click swaps the markdown via a callback and the block is re-highlighted
+    # asynchronously; poll for the new span count instead of reading it right
+    # after the click, which races the re-render and sees the old content.
+    wait.until(
+        lambda: len(
+            dash_dcc.find_element("code[data-highlighted='yes']").find_elements(
+                By.TAG_NAME, "span"
+            )
+        )
+        == 3,
+        timeout=4,
+    )
 
     assert dash_dcc.get_logs() == []

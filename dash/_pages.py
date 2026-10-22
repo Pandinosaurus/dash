@@ -1,21 +1,20 @@
 import collections
+import functools
 import importlib
+import importlib.util  # to make the type checker happy
 import os
 import re
 import sys
 from fnmatch import fnmatch
-from pathlib import Path
 from os.path import isfile, join
+from pathlib import Path
 from urllib.parse import parse_qs
 
-import flask
-
 from . import _validate
-from ._utils import AttributeDict
-from ._get_paths import get_relative_path
 from ._callback_context import context_value
 from ._get_app import get_app
-
+from ._get_paths import get_relative_path
+from ._utils import AttributeDict, get_root_path
 
 CONFIG = AttributeDict()
 PAGE_REGISTRY = collections.OrderedDict()
@@ -85,10 +84,10 @@ def _infer_path(module_name, template):
 
 
 def _module_name_is_package(module_name):
-    return (
-        module_name in sys.modules
-        and Path(sys.modules[module_name].__file__).name == "__init__.py"
-    )
+    if module_name not in sys.modules:
+        return False
+    file = sys.modules[module_name].__file__
+    return file and file.endswith("__init__.py")
 
 
 def _path_to_module_name(path):
@@ -98,7 +97,7 @@ def _path_to_module_name(path):
 def _infer_module_name(page_path):
     relative_path = page_path.split(CONFIG.pages_folder)[-1]
     module = _path_to_module_name(relative_path)
-    proj_root = flask.helpers.get_root_path(CONFIG.name)
+    proj_root = get_root_path(CONFIG.name)
     if CONFIG.pages_folder.startswith(proj_root):
         parent_path = CONFIG.pages_folder[len(proj_root) :]
     else:
@@ -113,16 +112,14 @@ def _infer_module_name(page_path):
 
 
 def _parse_query_string(search):
-    if search and len(search) > 0 and search[0] == "?":
-        search = search[1:]
-    else:
+    if not search or not search.startswith("?"):
         return {}
 
-    parsed_qs = {}
-    for (k, v) in parse_qs(search).items():
-        v = v[0] if len(v) == 1 else v
-        parsed_qs[k] = v
-    return parsed_qs
+    query_string = search[1:]
+
+    parsed_qs = parse_qs(query_string, keep_blank_values=True)
+
+    return {k: v[0] if len(v) == 1 else v for k, v in parsed_qs.items()}
 
 
 def _parse_path_variables(pathname, path_template):
@@ -133,30 +130,26 @@ def _parse_path_variables(pathname, path_template):
          returns **{"asset_id": "a100"}
     """
 
-    # parse variable definitions e.g. <var_name> from template
-    # and create pattern to match
     wildcard_pattern = re.sub("<.*?>", "*", path_template)
-    var_pattern = re.sub("<.*?>", "(.*)", path_template)
 
-    # check that static sections of the pathname match the template
+    # fnmatch compiles to a pattern that cannot backtrack, so it gates out
+    # non-matching paths cheaply before the capturing match below runs.
     if not fnmatch(pathname, wildcard_pattern):
         return None
 
-    # parse variable names e.g. var_name from template
+    match = _path_template_regex(path_template).fullmatch(pathname)
+    if match is None:
+        return None
+
     var_names = re.findall("<(.*?)>", path_template)
-
-    # parse variables from path
-    variables = re.findall(var_pattern, pathname)
-    variables = variables[0] if isinstance(variables[0], tuple) else variables
-
-    return dict(zip(var_names, variables))
+    return dict(zip(var_names, match.groups()))
 
 
-def _create_redirect_function(redirect_to):
-    def redirect():
-        return flask.redirect(redirect_to, code=301)
-
-    return redirect
+@functools.lru_cache(maxsize=None)
+def _path_template_regex(path_template):
+    static_parts = re.split("<.*?>", path_template)
+    # DOTALL to agree with fnmatch, whose * also matches newlines.
+    return re.compile("(.*)".join(re.escape(p) for p in static_parts), re.DOTALL)
 
 
 def _set_redirect(redirect_from, path):
@@ -164,11 +157,7 @@ def _set_redirect(redirect_from, path):
     if redirect_from and len(redirect_from):
         for redirect in redirect_from:
             fullname = app.get_relative_path(redirect)
-            app.server.add_url_rule(
-                fullname,
-                fullname,
-                _create_redirect_function(app.get_relative_path(path)),
-            )
+            app.backend.add_redirect_rule(app, fullname, app.get_relative_path(path))
 
 
 def register_page(
@@ -235,25 +224,28 @@ def register_page(
        order `0`
 
     - `title`:
-       (string or function) The name of the page <title>. That is, what appears in the browser title.
-       If not supplied, will use the supplied `name` or will be inferred by module,
-       e.g. `pages.weekly_analytics` to `Weekly analytics`
+      (string or function) Specifies the page title displayed in the browser tab and used in social media meta tags.
+        If not supplied, the app's title is used if different from the default "Dash".
+        Otherwise, the title is the given `name` or inferred from the module name.
+        For example, `pages.weekly_analytics` is inferred as "Weekly Analytics"
 
     - `description`:
-       (string or function) The <meta type="description"></meta>.
-       If not supplied, then nothing is supplied.
+      (string or function) Specifies the page description used in the `<meta name="description">` tag and in social
+       media meta tags. If not supplied, the app's description is used if available.
 
     - `image`:
-       The meta description image used by social media platforms.
-       If not supplied, then it looks for the following images in `assets/`:
-        - A page specific image: `assets/<module>.<extension>` is used, e.g. `assets/weekly_analytics.png`
-        - A generic app image at `assets/app.<extension>`
-        - A logo at `assets/logo.<extension>`
-        When inferring the image file, it will look for the following extensions:
+      Specifies the image used in social media meta tags. This can be an image filename in the `assets/` folder
+      or a URL. If not supplied, Dash looks for the following images in `assets/`:
+
+      - A page-specific image: `assets/<module>.<extension>`, for example `assets/weekly_analytics.png`
+      - A generic app image: `assets/app.<extension>`
+      - A logo: `assets/logo.<extension>`
+        When inferring the image file, Dash checks for the following extensions:
         APNG, AVIF, GIF, JPEG, JPG, PNG, SVG, WebP.
 
-    -  `image_url`:
-       Overrides the image property and sets the `<image>` meta tag to the provided image URL.
+    - `image_url`:
+      Specifies the URL of the image used in social media meta tags. This property is retained for backwards
+      compatibility. Use `image` to specify either an image filename or a URL.
 
     - `redirect_from`:
        A list of paths that should redirect to this page.
@@ -319,10 +311,22 @@ def register_page(
     )
     page.update(
         supplied_title=title,
-        title=(title if title is not None else page["name"]),
+        title=(
+            title
+            if title is not None
+            else CONFIG.title
+            if CONFIG.title != "Dash"
+            else page["name"]
+        ),
     )
     page.update(
-        description=description if description else "",
+        description=(
+            description
+            if description
+            else CONFIG.description
+            if CONFIG.description
+            else ""
+        ),
         order=order,
         supplied_order=order,
         supplied_layout=layout,
@@ -382,31 +386,53 @@ def _path_to_page(path_id):
     return {}, None
 
 
-def _page_meta_tags(app):
-    start_page, path_variables = _path_to_page(flask.request.path.strip("/"))
+def _get_image_url(app, request, image, supplied_image_url):
+    if supplied_image_url:
+        return supplied_image_url
 
-    # use the supplied image_url or create url based on image in the assets folder
-    image = start_page.get("image", "")
     if image:
+        if image.startswith(("http://", "https://")):
+            return image
+
         image = app.get_asset_url(image)
-    assets_image_url = (
-        "".join([flask.request.url_root, image.lstrip("/")]) if image else None
-    )
-    supplied_image_url = start_page.get("image_url")
-    image_url = supplied_image_url if supplied_image_url else assets_image_url
+        return "".join([request.root, image.lstrip("/")])
 
-    title = start_page.get("title", app.title)
-    if callable(title):
-        title = title(**path_variables) if path_variables else title()
+    return None
 
-    description = start_page.get("description", "")
-    if callable(description):
-        description = description(**path_variables) if path_variables else description()
+
+def _page_meta_tags(app, request):
+    if not app.use_pages and not (app.description or app.image):
+        return []
+
+    title = app.title
+    description = app.description or ""
+    image = app.image
+    supplied_image_url = None
+
+    if app.use_pages:
+        request_path = request.path
+        start_page, path_variables = _path_to_page(request_path.strip("/"))
+
+        if start_page:
+            title = start_page.get("title", title)
+            description = start_page.get("description", description)
+            image = start_page.get("image") or image
+            supplied_image_url = start_page.get("image_url")
+
+        if callable(title):
+            title = title(**path_variables) if path_variables else title()
+
+        if callable(description):
+            description = (
+                description(**path_variables) if path_variables else description()
+            )
+
+    image_url = _get_image_url(app, request, image, supplied_image_url)
 
     return [
         {"name": "description", "content": description},
         {"property": "twitter:card", "content": "summary_large_image"},
-        {"property": "twitter:url", "content": flask.request.url},
+        {"property": "twitter:url", "content": request.url},
         {"property": "twitter:title", "content": title},
         {"property": "twitter:description", "content": description},
         {"property": "twitter:image", "content": image_url or ""},
@@ -431,8 +457,8 @@ def _import_layouts_from_pages(pages_folder):
 
             module_name = _infer_module_name(page_path)
             spec = importlib.util.spec_from_file_location(module_name, page_path)
-            page_module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(page_module)
+            page_module = importlib.util.module_from_spec(spec)  # type: ignore[reportArgumentType]
+            spec.loader.exec_module(page_module)  # type: ignore[reportOptionalMemberAccess]
             sys.modules[module_name] = page_module
 
             if (

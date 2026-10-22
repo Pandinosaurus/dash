@@ -1,4 +1,4 @@
-import {find, flatten, map, partition, pluck, sort, uniq} from 'ramda';
+import {find, flatten, map, partition, sort} from 'ramda';
 
 import {IStoreState} from '../store';
 
@@ -16,6 +16,8 @@ import {stringifyId} from '../actions/dependencies';
 import {combineIdAndProp} from '../actions/dependencies_ts';
 
 import isAppReady from '../actions/isAppReady';
+
+import {MAX_CONCURRENT_HTTP_CALLBACKS, usesRequestSlot} from './requestSlot';
 
 import {
     IBlockedCallback,
@@ -53,13 +55,16 @@ const getStash = (
     return {allOutputs, allPropIds};
 };
 
-const getIds = (cb: ICallback, paths: any) =>
-    uniq(
-        pluck('id', [
-            ...flatten(cb.getInputs(paths)),
-            ...flatten(cb.getState(paths))
-        ])
-    );
+const getIds = (cb: ICallback, paths: any) => {
+    const items = [
+        ...flatten(cb.getInputs(paths)),
+        ...flatten(cb.getState(paths))
+    ];
+
+    const uniqueIds = new Map(items.map(item => [stringifyId(item.id), item]));
+    const uniqueItems = Array.from(uniqueIds.values());
+    return uniqueItems;
+};
 
 const observer: IStoreObserverDefinition<IStoreState> = {
     observer: async ({dispatch, getState}) => {
@@ -79,22 +84,37 @@ const observer: IStoreObserverDefinition<IStoreState> = {
             return;
         }
 
-        const available = Math.max(0, 12 - executing.length - watched.length);
+        // Only callbacks holding an in-flight HTTP request count toward the
+        // budget; clientside, streaming and websocket-routed ones are exempt.
+        const countsToward = (cb: ICallback) => usesRequestSlot(cb, config);
+
+        const inFlight =
+            executing.filter(countsToward).length +
+            watched.filter(countsToward).length;
+        const available = Math.max(0, MAX_CONCURRENT_HTTP_CALLBACKS - inFlight);
 
         // Order prioritized callbacks based on depth and breadth of callback chain
         prioritized = sort(sortPriority, prioritized);
 
-        // Divide between sync and async
-        const [syncCallbacks, asyncCallbacks] = partition(
-            cb => isAppReady(layout, paths, getIds(cb, paths)) === true,
-            prioritized
+        // Exempt callbacks always dispatch; only request-slot callbacks are
+        // limited to the available budget (ready ones first, as before).
+        const [budgeted, exempt] = partition(countsToward, prioritized);
+
+        const isReady = (cb: ICallback) =>
+            isAppReady(layout, paths, getIds(cb, paths)) === true;
+
+        const [budgetedSync, budgetedAsync] = partition(isReady, budgeted);
+        const pickedBudgetedSync = budgetedSync.slice(0, available);
+        const pickedBudgetedAsync = budgetedAsync.slice(
+            0,
+            available - pickedBudgetedSync.length
         );
 
-        const pickedSyncCallbacks = syncCallbacks.slice(0, available);
-        const pickedAsyncCallbacks = asyncCallbacks.slice(
-            0,
-            available - pickedSyncCallbacks.length
-        );
+        const [exemptSync, exemptAsync] = partition(isReady, exempt);
+
+        // Divide between sync (components ready) and async (deferred until ready)
+        const pickedSyncCallbacks = [...exemptSync, ...pickedBudgetedSync];
+        const pickedAsyncCallbacks = [...exemptAsync, ...pickedBudgetedAsync];
 
         if (pickedSyncCallbacks.length) {
             dispatch(

@@ -110,9 +110,21 @@ Upload.propTypes = {
     min_size: PropTypes.number,
 
     /**
-     * Allow dropping multiple files
+     * Allow dropping multiple files.
+     * When true, enables folder drag-and-drop support.
+     * The folder hierarchy is preserved in filenames (e.g., 'folder/subfolder/file.txt').
+     * Note: Folder drag-and-drop is supported in Chrome, Edge, and Opera.
      */
     multiple: PropTypes.bool,
+
+    /**
+     * Enable folder selection in the file picker dialog.
+     * When true with multiple=True, the file picker allows selecting folders instead of files.
+     * Note: When folder selection is enabled, individual files cannot be selected via the button.
+     * Use separate Upload components if you need both file and folder selection options.
+     * Folder selection is supported in Chrome, Edge, and Opera.
+     */
+    enable_folder_selection: PropTypes.bool,
 
     /**
      * HTML class name of the component
@@ -158,24 +170,6 @@ Upload.propTypes = {
      * Dash-supplied function for updating props
      */
     setProps: PropTypes.func,
-
-    /**
-     * Object that holds the loading state object coming from dash-renderer
-     */
-    loading_state: PropTypes.shape({
-        /**
-         * Determines if the component is loading or not
-         */
-        is_loading: PropTypes.bool,
-        /**
-         * Holds which property is loading
-         */
-        prop_name: PropTypes.string,
-        /**
-         * Holds the name of the component that is loading
-         */
-        component_name: PropTypes.string,
-    }),
 };
 
 Upload.defaultProps = {
@@ -184,6 +178,7 @@ Upload.defaultProps = {
     max_size: -1,
     min_size: 0,
     multiple: false,
+    enable_folder_selection: false,
     style: {},
     style_active: {
         borderStyle: 'solid',

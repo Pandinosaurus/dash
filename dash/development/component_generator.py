@@ -3,12 +3,12 @@ from collections import OrderedDict
 import json
 import sys
 import subprocess
-import shlex
 import os
 import argparse
 import shutil
 import functools
-import pkg_resources
+import importlib.resources as importlib_resources
+
 import yaml
 
 from ._r_components_generation import write_class_file
@@ -18,6 +18,7 @@ from ._py_components_generation import generate_imports
 from ._py_components_generation import generate_classes_files
 from ._jl_components_generation import generate_struct_file
 from ._jl_components_generation import generate_module
+from ._generate_prop_types import generate_prop_types
 
 reserved_words = [
     "UNDEFINED",
@@ -49,13 +50,21 @@ def generate_components(
     metadata=None,
     keep_prop_order=None,
     max_props=None,
+    custom_typing_module=None,
 ):
 
     project_shortname = project_shortname.replace("-", "_").rstrip("/\\")
 
-    is_windows = sys.platform == "win32"
-
-    extract_path = pkg_resources.resource_filename("dash", "extract-meta.js")
+    # Get path to extract-meta.js using importlib.resources
+    try:
+        # Python 3.9+
+        extract_path = str(
+            importlib_resources.files("dash").joinpath("extract-meta.js")
+        )
+    except AttributeError:
+        # Python 3.8 fallback
+        with importlib_resources.path("dash", "extract-meta.js") as p:
+            extract_path = str(p)
 
     reserved_patterns = "|".join(f"^{p}$" for p in reserved_words)
 
@@ -71,16 +80,12 @@ def generate_components(
         # Ensure local node modules is used when the script is packaged.
         env["MODULES_PATH"] = os.path.abspath("./node_modules")
 
-        cmd = shlex.split(
-            f'node {extract_path} "{ignore}" "{reserved_patterns}" {components_source}',
-            posix=not is_windows,
-        )
+        cmd = ["node", extract_path, ignore, reserved_patterns, components_source]
 
         proc = subprocess.Popen(  # pylint: disable=consider-using-with
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            shell=is_windows,
             env=env,
         )
         out, err = proc.communicate()
@@ -98,7 +103,9 @@ def generate_components(
 
         metadata = safe_json_loads(out.decode("utf-8"))
 
-    py_generator_kwargs = {}
+    py_generator_kwargs = {
+        "custom_typing_module": custom_typing_module,
+    }
     if keep_prop_order is not None:
         keep_prop_order = [
             component.strip(" ") for component in keep_prop_order.split(",")
@@ -110,10 +117,12 @@ def generate_components(
 
     generator_methods = [functools.partial(generate_class_file, **py_generator_kwargs)]
 
+    pkg_data = None
     if rprefix is not None or jlprefix is not None:
         with open("package.json", "r", encoding="utf-8") as f:
             pkg_data = safe_json_loads(f.read())
 
+    rpkg_data = None
     if rprefix is not None:
         if not os.path.exists("man"):
             os.makedirs("man")
@@ -122,8 +131,6 @@ def generate_components(
         if os.path.isfile("dash-info.yaml"):
             with open("dash-info.yaml", encoding="utf-8") as yamldata:
                 rpkg_data = yaml.safe_load(yamldata)
-        else:
-            rpkg_data = None
         generator_methods.append(
             functools.partial(write_class_file, prefix=rprefix, rpkg_data=rpkg_data)
         )
@@ -135,10 +142,16 @@ def generate_components(
 
     components = generate_classes_files(project_shortname, metadata, *generator_methods)
 
+    generate_prop_types(
+        metadata,
+        project_shortname,
+        custom_typing_module=custom_typing_module,
+    )
+
     with open(
         os.path.join(project_shortname, "metadata.json"), "w", encoding="utf-8"
     ) as f:
-        json.dump(metadata, f, indent=2)
+        json.dump(metadata, f, separators=(",", ":"))
 
     generate_imports(project_shortname, components)
 
@@ -236,10 +249,22 @@ def component_build_arg_parser():
         "but you may also want to reduce further for improved readability at the "
         "expense of auto-completion for the later props. Use 0 to include all props.",
     )
+    parser.add_argument(
+        "-t",
+        "--custom-typing-module",
+        type=str,
+        default="dash_prop_typing",
+        help=" Module containing custom typing definition for components."
+        "Can contains two variables:\n"
+        " - custom_imports: dict[ComponentName, list[str]].\n"
+        " - custom_props: dict[ComponentName, dict[PropName, function]].\n",
+    )
     return parser
 
 
 def cli():
+    # Add current path for loading modules.
+    sys.path.insert(0, ".")
     args = component_build_arg_parser().parse_args()
     generate_components(
         args.components_source,
@@ -253,6 +278,7 @@ def cli():
         jlprefix=args.jl_prefix,
         keep_prop_order=args.keep_prop_order,
         max_props=args.max_props,
+        custom_typing_module=args.custom_typing_module,
     )
 
 
@@ -260,12 +286,12 @@ def cli():
 def byteify(input_object):
     if isinstance(input_object, dict):
         return OrderedDict(
-            [(byteify(key), byteify(value)) for key, value in input_object.iteritems()]
+            [(byteify(key), byteify(value)) for key, value in input_object.items()]
         )
     if isinstance(input_object, list):
         return [byteify(element) for element in input_object]
-    if isinstance(input_object, unicode):  # noqa:F821
-        return input_object.encode("utf-8")
+    if isinstance(input_object, str):  # noqa:F821
+        return input_object.encode(encoding="utf-8")
     return input_object
 
 

@@ -29,19 +29,37 @@ import {
     IStoredCallback,
     IBlockedCallback,
     IPrioritizedCallback,
-    LongCallbackInfo,
+    BackgroundCallbackInfo,
     CallbackResponse,
-    CallbackResponseData
+    CallbackResponseData,
+    PatchedOutputs,
+    SideUpdateOutput
 } from '../types/callbacks';
 import {isMultiValued, stringifyId, isMultiOutputProp} from './dependencies';
 import {urlBase} from './utils';
-import {getCSRFHeader} from '.';
+import {getCSRFHeader, dispatchError, setPaths} from '.';
 import {createAction, Action} from 'redux-actions';
 import {addHttpHeaders} from '../actions';
 import {notifyObservers, updateProps} from './index';
 import {CallbackJobPayload} from '../reducers/callbackJobs';
-import {handlePatch, isPatch} from './patch';
-import {getPath} from './paths';
+import {isPatch, parsePatchProps} from './patch';
+import {createPatchAnalysis} from './patchAnalysis';
+import {computePaths, getPath} from './paths';
+
+import {requestDependencies} from './requestDependencies';
+
+import {loadLibrary} from '../utils/libraries';
+import {getStreamClient, isStreamMultiplexed} from '../utils/streamClient';
+
+import {parsePMCId} from './patternMatching';
+import {replacePMC} from './patternMatching';
+import {loaded, loading} from './loading';
+import {getComponentLayout} from '../wrapper/wrapping';
+import {
+    getWorkerClient,
+    isWebSocketEnabled,
+    isWebSocketAvailable
+} from '../utils/workerClient';
 
 export const addBlockedCallbacks = createAction<IBlockedCallback[]>(
     CallbackActionType.AddBlocked
@@ -113,22 +131,27 @@ function unwrapIfNotMulti(
 
     if (idProps.length !== 1) {
         if (!idProps.length) {
-            const isStr = typeof spec.id === 'string';
-            msg =
-                'A nonexistent object was used in an `' +
-                depType +
-                '` of a Dash callback. The id of this object is ' +
-                (isStr
-                    ? '`' + spec.id + '`'
-                    : JSON.stringify(spec.id) +
-                      (anyVals ? ' with MATCH values ' + anyVals : '')) +
-                ' and the property is `' +
-                spec.property +
-                (isStr
-                    ? '`. The string ids in the current layout are: [' +
-                      keys(paths.strs).join(', ') +
-                      ']'
-                    : '`. The wildcard ids currently available are logged above.');
+            if (spec.allow_optional) {
+                idProps = [{...spec, value: null}];
+                msg = '';
+            } else {
+                const isStr = typeof spec.id === 'string';
+                msg =
+                    'A nonexistent object was used in an `' +
+                    depType +
+                    '` of a Dash callback. The id of this object is ' +
+                    (isStr
+                        ? '`' + spec.id + '`'
+                        : JSON.stringify(spec.id) +
+                          (anyVals ? ' with MATCH values ' + anyVals : '')) +
+                    ' and the property is `' +
+                    spec.property +
+                    (isStr
+                        ? '`. The string ids in the current layout are: [' +
+                          keys(paths.strs).join(', ') +
+                          ']'
+                        : '`. The wildcard ids currently available are logged above.');
+            }
         } else {
             msg =
                 'Multiple objects were found for an `' +
@@ -194,7 +217,6 @@ function fillVals(
         // That's a real problem, so throw the first message as an error.
         refErr(errors, paths);
     }
-
     return inputVals;
 }
 
@@ -212,11 +234,60 @@ function refErr(errors: any, paths: any) {
 const getVals = (input: any) =>
     Array.isArray(input) ? pluck('value', input) : input.value;
 
-const zipIfArray = (a: any, b: any) =>
-    Array.isArray(a) ? zip(a, b) : [[a, b]];
+const zipIfArray = (a: any, b: any) => {
+    if (Array.isArray(a)) {
+        // For client-side callbacks with multiple Outputs, only return a single dash_clientside.no_update
+        if (b === (window as any).dash_clientside.no_update) {
+            return zip(a, [b]);
+        }
+        return zip(a, b);
+    }
+    return [[a, b]];
+};
 
 function cleanOutputProp(property: string) {
     return property.split('@')[0];
+}
+
+function patchedResultFields(patchedOutputs: PatchedOutputs) {
+    return keys(patchedOutputs).length ? {patchedOutputs} : {};
+}
+
+// When the Layout may have changed, run each output through parsePatchProps against
+// the current layout, recording a PatchAnalysis for each output that
+// returned a Patch. Shared by the clientside and serverside result paths
+function applyPatchedOutputs(
+    outputs: any,
+    paths: any,
+    currentLayout: any,
+    data: any
+) {
+    const patchedOutputs: PatchedOutputs = {};
+    flatten(outputs).forEach((out: any) => {
+        const propName = cleanOutputProp(out.property);
+        const outputPath = getPath(paths, out.id);
+        const idStr = stringifyId(out.id);
+        const dataPath = [idStr, propName];
+        const outputValue = path(dataPath, data);
+        if (outputValue === undefined) {
+            return;
+        }
+        if (isPatch(outputValue)) {
+            // One analysis per output, shared by all of its
+            // patched props
+            patchedOutputs[idStr] =
+                patchedOutputs[idStr] || createPatchAnalysis();
+        }
+        const oldProps =
+            path(outputPath.concat(['props']), currentLayout) || {};
+        const newProps = parsePatchProps(
+            {[propName]: outputValue},
+            oldProps,
+            patchedOutputs[idStr]
+        );
+        data = assocPath(dataPath, newProps[propName], data);
+    });
+    return {data, patchedOutputs};
 }
 
 async function handleClientside(
@@ -260,10 +331,14 @@ async function handleClientside(
             prop_id: prop_id,
             value: inputDict[prop_id]
         }));
+        dc.callback_context.triggered_id = getTriggeredId(
+            payload.changedPropIds
+        );
         dc.callback_context.inputs_list = inputs;
         dc.callback_context.inputs = inputDict;
         dc.callback_context.states_list = state;
         dc.callback_context.states = stateDict;
+        dc.callback_context.outputs_list = outputs;
 
         let returnValue = dc[namespace][function_name](...args);
 
@@ -273,16 +348,18 @@ async function handleClientside(
             returnValue = await returnValue;
         }
 
-        zipIfArray(outputs, returnValue).forEach(([outi, reti]) => {
-            zipIfArray(outi, reti).forEach(([outij, retij]) => {
-                const {id, property} = outij;
-                const idStr = stringifyId(id);
-                const dataForId = (result[idStr] = result[idStr] || {});
-                if (retij !== dc.no_update) {
-                    dataForId[cleanOutputProp(property)] = retij;
-                }
+        if (outputs) {
+            zipIfArray(outputs, returnValue).forEach(([outi, reti]) => {
+                zipIfArray(outi, reti).forEach(([outij, retij]) => {
+                    const {id, property} = outij;
+                    const idStr = stringifyId(id);
+                    const dataForId = (result[idStr] = result[idStr] || {});
+                    if (retij !== dc.no_update) {
+                        dataForId[cleanOutputProp(property)] = retij;
+                    }
+                });
             });
-        });
+        }
     } catch (e) {
         if (e === dc.PreventUpdate) {
             status = STATUS.PREVENT_UPDATE;
@@ -319,32 +396,199 @@ async function handleClientside(
     return result;
 }
 
-function sideUpdate(outputs: any, dispatch: any, paths: any) {
-    toPairs(outputs).forEach(([id, value]) => {
-        const [componentId, propName] = id.split('.');
-        const componentPath = paths.strs[componentId];
+function updateComponent(component_id: any, props: any, cb: ICallbackPayload) {
+    return function (dispatch: any, getState: any) {
+        const {paths, config} = getState();
+        const componentPath = getPath(paths, component_id);
+        if (!componentPath) {
+            if (!config.suppress_callback_exceptions) {
+                dispatchError(dispatch)(
+                    'ID running component not found in layout',
+                    [
+                        'Component defined in running keyword not found in layout.',
+                        `Component id: "${stringifyId(component_id)}"`,
+                        'This ID was used in the callback(s) for Output(s):',
+                        `${cb.output}`,
+                        'You can suppress this exception by setting',
+                        '`suppress_callback_exceptions=True`.'
+                    ]
+                );
+            }
+            // We need to stop further processing because functions further on
+            // can't operate on an 'undefined' object, and they will throw an
+            // error.
+            return;
+        }
         dispatch(
             updateProps({
-                props: {[propName]: value},
-                itempath: componentPath
+                props,
+                itempath: componentPath,
+                renderType: 'callback'
             })
         );
-        dispatch(
-            notifyObservers({id: componentId, props: {[propName]: value}})
-        );
+        dispatch(notifyObservers({id: component_id, props}));
+    };
+}
+
+/**
+ * Update a component props with `running`/`progress`/`set_props` calls.
+ *
+ * @param outputs Props to update.
+ * @param cb The originating callback info.
+ * @returns
+ */
+function sideUpdate(outputs: SideUpdateOutput, cb: ICallbackPayload) {
+    return function (dispatch: any, getState: any) {
+        toPairs(outputs)
+            .reduce((acc, [id, value], i) => {
+                let componentId = id,
+                    propName,
+                    replacedIds = [];
+
+                if (id.startsWith('{')) {
+                    [componentId, propName] = parsePMCId(id);
+                    replacedIds = replacePMC(componentId, cb, i, getState);
+                } else if (id.includes('.')) {
+                    [componentId, propName] = id.split('.');
+                }
+
+                const props = propName ? {[propName]: value} : value;
+
+                if (replacedIds.length === 0) {
+                    acc.push([componentId, props]);
+                } else if (replacedIds.length === 1) {
+                    acc.push([replacedIds[0], props]);
+                } else {
+                    replacedIds.forEach((rep: any) => {
+                        acc.push([rep, props]);
+                    });
+                }
+
+                return acc;
+            }, [] as any[])
+            .forEach(([id, idProps]) => {
+                const state = getState();
+
+                const componentPath = getPath(state.paths, id);
+                let oldComponent = {props: {}};
+                if (componentPath) {
+                    oldComponent = getComponentLayout(componentPath, state);
+                }
+
+                const oldProps = oldComponent?.props || {};
+
+                const patchedProps = parsePatchProps(idProps, oldProps);
+
+                dispatch(updateComponent(id, patchedProps, cb));
+
+                if (!componentPath) {
+                    // Component doesn't exist, doesn't matter just allow the
+                    // callback to continue.
+                    return;
+                }
+
+                dispatch(
+                    setPaths(
+                        computePaths(
+                            {
+                                ...oldComponent,
+                                props: {...oldComponent.props, ...patchedProps}
+                            },
+                            [...componentPath],
+                            state.paths,
+                            state.paths.events
+                        )
+                    )
+                );
+            });
+    };
+}
+
+/**
+ * Apply an intermediate frame from a streaming callback.
+ *
+ * The frame's declared outputs are flattened to `id.prop` keys and applied
+ * through the sideUpdate path (parsePatchProps + updateComponent), so Patch
+ * values apply incrementally, paths recompute for newly added components,
+ * and observers are notified — the same semantics as set_props. The
+ * callback's execution promise stays pending until the terminal frame.
+ */
+function applyStreamFrame(
+    dispatch: any,
+    frame: CallbackResponseData,
+    payload: ICallbackPayload
+) {
+    if (frame.response) {
+        const flat: SideUpdateOutput = {};
+        toPairs(frame.response).forEach(([id, props]) => {
+            toPairs(props as Record<string, any>).forEach(([prop, value]) => {
+                flat[`${id}.${prop}`] = value;
+            });
+        });
+        if (keys(flat).length) {
+            dispatch(sideUpdate(flat, payload));
+        }
+    }
+    if (frame.sideUpdate) {
+        dispatch(sideUpdate(frame.sideUpdate, payload));
+    }
+}
+
+/**
+ * Run a streaming callback over the multiplexed transport: a single downlink
+ * shared by all of the page's streams -- and, hosted in a SharedWorker, by all
+ * of the browser's tabs (see utils/streamClient). Frames are
+ * applied as they arrive, so the resolved value is empty like the WebSocket
+ * streaming path.
+ */
+async function handleStreamCallback(
+    dispatch: any,
+    config: any,
+    payload: ICallbackPayload,
+    running: any
+): Promise<CallbackResponse> {
+    let runningOff: any;
+    if (running) {
+        dispatch(sideUpdate(running.running, payload));
+        runningOff = running.runningOff;
+    }
+    const url = `${urlBase(config)}_dash-update-component`;
+    const init = mergeDeepRight(config.fetch, {
+        headers: getCSRFHeader(config) as any
     });
+    try {
+        await getStreamClient(config).run(
+            url,
+            init,
+            config.end_id,
+            payload,
+            (frame: any) => {
+                if (frame.dist) {
+                    Promise.all(frame.dist.map(loadLibrary));
+                }
+                applyStreamFrame(dispatch, frame, payload);
+            }
+        );
+    } finally {
+        if (runningOff) {
+            dispatch(sideUpdate(runningOff, payload));
+        }
+    }
+    // Frames were applied as they arrived; the terminal store update is a no-op.
+    return {};
 }
 
 function handleServerside(
     dispatch: any,
     hooks: any,
     config: any,
-    payload: any,
-    paths: any,
-    long: LongCallbackInfo | undefined,
+    payload: ICallbackPayload,
+    background: BackgroundCallbackInfo | undefined,
     additionalArgs: [string, string, boolean?][] | undefined,
     getState: any,
-    output: string
+    running: any,
+    compressPayload?: boolean,
+    compressThreshold?: number
 ): Promise<CallbackResponse> {
     if (hooks.request_pre) {
         hooks.request_pre(payload);
@@ -358,9 +602,15 @@ function handleServerside(
     let progressDefault: any;
     let moreArgs = additionalArgs;
 
-    const fetchCallback = () => {
-        const headers = getCSRFHeader() as any;
+    if (running) {
+        dispatch(sideUpdate(running.running, payload));
+        runningOff = running.runningOff;
+    }
+
+    const fetchCallback = async () => {
+        const headers = getCSRFHeader(config) as any;
         let url = `${urlBase(config)}_dash-update-component`;
+        let newBody = body;
 
         const addArg = (name: string, value: string) => {
             let delim = '?';
@@ -369,11 +619,24 @@ function handleServerside(
             }
             url = `${url}${delim}${name}=${value}`;
         };
-        if (cacheKey) {
-            addArg('cacheKey', cacheKey);
+        // Echo the server-issued token so the server can bind/verify the
+        // background-callback handles (cacheKey/job/oldJob/cancelJob) it signs.
+        if (config.end_id) {
+            addArg('endId', config.end_id);
         }
-        if (job) {
-            addArg('job', job);
+        if (cacheKey || job) {
+            if (cacheKey) addArg('cacheKey', cacheKey);
+            if (job) addArg('job', job);
+
+            // clear inputs as background callback doesnt need inputs, just verify for context
+            const tmpBody = JSON.parse(newBody);
+            for (let i = 0; i < tmpBody.inputs.length; i++) {
+                tmpBody.inputs[i]['value'] = null;
+            }
+            for (let i = 0; i < (tmpBody?.state || []).length; i++) {
+                tmpBody.state[i]['value'] = null;
+            }
+            newBody = JSON.stringify(tmpBody);
         }
 
         if (moreArgs) {
@@ -381,12 +644,36 @@ function handleServerside(
             moreArgs = moreArgs.filter(([_, __, single]) => !single);
         }
 
+        let fetchBody: BodyInit = newBody;
+
+        // Compress payload if enabled and size threshold is met
+        if (
+            compressPayload &&
+            compressThreshold !== undefined &&
+            newBody.length > compressThreshold
+        ) {
+            try {
+                const stream = new Blob([newBody])
+                    .stream()
+                    .pipeThrough(new CompressionStream('gzip'));
+                fetchBody = await new Response(stream).blob();
+                headers['Content-Encoding'] = 'gzip';
+            } catch (error) {
+                // Fall through to send uncompressed
+                // eslint-disable-next-line no-console
+                console.warn(
+                    'Sending uncompressed payload, because compressing failed:',
+                    error
+                );
+            }
+        }
+
         return fetch(
             url,
             mergeDeepRight(config.fetch, {
                 method: 'POST',
                 headers,
-                body
+                body: fetchBody
             })
         );
     };
@@ -464,14 +751,104 @@ function handleServerside(
                     dispatch(removeCallbackJob({jobId: job}));
                 }
                 if (runningOff) {
-                    sideUpdate(runningOff, dispatch, paths);
+                    dispatch(sideUpdate(runningOff, payload));
                 }
                 if (progressDefault) {
-                    sideUpdate(progressDefault, dispatch, paths);
+                    dispatch(sideUpdate(progressDefault, payload));
+                }
+            };
+
+            // Streaming callbacks: read NDJSON frames as they arrive,
+            // apply each one immediately, and resolve on the terminal frame.
+            const handleStreamedResponse = async (streamRes: any) => {
+                const reader = streamRes.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+                let lastResponse: CallbackResponse | undefined;
+                let finished = false;
+
+                const processFrame = async (frame: CallbackResponseData) => {
+                    if (frame.done) {
+                        finished = true;
+                        completeJob();
+                        if (frame.error) {
+                            recordProfile({});
+                            reject(
+                                new Error(
+                                    frame.error.message || 'Callback error'
+                                )
+                            );
+                            return;
+                        }
+                        if (hooks.request_post) {
+                            hooks.request_post(payload, lastResponse);
+                        }
+                        recordProfile(lastResponse || {});
+                        // Frames were already applied; resolve empty so the
+                        // terminal store update is a no-op (Patch frames must
+                        // not re-apply).
+                        resolve({});
+                        return;
+                    }
+                    if (frame.dist) {
+                        await Promise.all(frame.dist.map(loadLibrary));
+                    }
+                    lastResponse = frame.response;
+                    applyStreamFrame(dispatch, frame, payload);
+                };
+
+                try {
+                    for (;;) {
+                        const {done, value} = await reader.read();
+                        if (done) {
+                            break;
+                        }
+                        buffer += decoder.decode(value, {stream: true});
+                        const lines = buffer.split('\n');
+                        buffer = lines.pop() as string;
+                        for (const line of lines) {
+                            if (!line.trim()) {
+                                continue;
+                            }
+                            await processFrame(JSON.parse(line));
+                            if (finished) {
+                                reader.cancel();
+                                return;
+                            }
+                        }
+                    }
+                    if (buffer.trim() && !finished) {
+                        await processFrame(JSON.parse(buffer));
+                    }
+                } catch (err) {
+                    if (!finished) {
+                        finished = true;
+                        completeJob();
+                        if (lastResponse) {
+                            recordProfile(lastResponse);
+                            resolve({});
+                        } else {
+                            recordProfile({});
+                            reject(err);
+                        }
+                        return;
+                    }
+                }
+                if (!finished) {
+                    // Stream ended without a terminal frame (connection
+                    // dropped): clear loading, keep applied frames.
+                    completeJob();
+                    recordProfile(lastResponse || {});
+                    resolve({});
                 }
             };
 
             if (status === STATUS.OK) {
+                const contentType = res.headers.get('Content-Type') || '';
+                if (contentType.includes('application/x-ndjson') && res.body) {
+                    handleStreamedResponse(res);
+                    return;
+                }
                 res.json().then((data: CallbackResponseData) => {
                     if (!cacheKey && data.cacheKey) {
                         cacheKey = data.cacheKey;
@@ -483,33 +860,40 @@ function handleServerside(
                             cacheKey: data.cacheKey as string,
                             cancelInputs: data.cancel,
                             progressDefault: data.progressDefault,
-                            output
+                            output: JSON.stringify(payload.outputs)
                         };
                         dispatch(addCallbackJob(jobInfo));
                         job = data.job;
                     }
 
+                    if (data.sideUpdate) {
+                        dispatch(sideUpdate(data.sideUpdate, payload));
+                    }
+
                     if (data.progress) {
-                        sideUpdate(data.progress, dispatch, paths);
-                    }
-                    if (data.running) {
-                        sideUpdate(data.running, dispatch, paths);
-                    }
-                    if (!runningOff && data.runningOff) {
-                        runningOff = data.runningOff;
+                        dispatch(sideUpdate(data.progress, payload));
                     }
                     if (!progressDefault && data.progressDefault) {
                         progressDefault = data.progressDefault;
                     }
 
-                    if (!long || data.response !== undefined) {
-                        completeJob();
-                        finishLine(data);
+                    if (!background || data.response !== undefined) {
+                        if (data.dist) {
+                            Promise.all(data.dist.map(loadLibrary)).then(() => {
+                                completeJob();
+                                finishLine(data);
+                            });
+                        } else {
+                            completeJob();
+                            finishLine(data);
+                        }
                     } else {
                         // Poll chain.
                         setTimeout(
                             handle,
-                            long.interval !== undefined ? long.interval : 500
+                            background.interval !== undefined
+                                ? background.interval
+                                : 500
                         );
                     }
                 });
@@ -545,6 +929,177 @@ function handleServerside(
     });
 }
 
+/**
+ * Handle serverside callback via WebSocket connection.
+ *
+ * Uses the SharedWorker to send the callback request through the persistent
+ * WebSocket connection instead of HTTP POST.
+ */
+async function handleWebsocketCallback(
+    dispatch: any,
+    hooks: any,
+    config: any,
+    payload: ICallbackPayload,
+    running: any
+): Promise<CallbackResponse> {
+    if (hooks.request_pre) {
+        hooks.request_pre(payload);
+    }
+
+    const requestTime = Date.now();
+    let runningOff: any;
+
+    if (running) {
+        dispatch(sideUpdate(running.running, payload));
+        runningOff = running.runningOff;
+    }
+
+    const workerClient = getWorkerClient();
+
+    try {
+        // Ensure WebSocket connection is established
+        await workerClient.ensureConnected(config);
+
+        // Streaming callbacks deliver intermediate frames before the
+        // terminal response; apply each one as it arrives.
+        let lastStreamResponse: CallbackResponse | undefined;
+        const response = await workerClient.sendCallback(
+            payload,
+            (frame: CallbackResponseData) => {
+                lastStreamResponse = frame?.response;
+                applyStreamFrame(dispatch, frame, payload);
+            }
+        );
+
+        // Handle running off state
+        if (runningOff) {
+            dispatch(sideUpdate(runningOff, payload));
+        }
+
+        if (response.status === 'prevent_update') {
+            // Record timing for profiling
+            if (config.ui) {
+                const totalTime = Date.now() - requestTime;
+                dispatch(
+                    updateResourceUsage({
+                        id: payload.output,
+                        usage: {
+                            __dash_server: totalTime,
+                            __dash_client: totalTime,
+                            __dash_upload: 0,
+                            __dash_download: 0
+                        },
+                        status: STATUS.PREVENT_UPDATE,
+                        result: {},
+                        inputs: payload.inputs,
+                        state: payload.state
+                    })
+                );
+            }
+            return {};
+        }
+
+        if (response.status === 'error') {
+            throw new Error(response.message || 'Callback error');
+        }
+
+        if (response.stream) {
+            // Terminal frame of a streamed callback: every frame was already
+            // applied on arrival, so resolve empty (the terminal store update
+            // must be a no-op — Patch frames must not re-apply).
+            if (hooks.request_post) {
+                hooks.request_post(payload, lastStreamResponse);
+            }
+            if (config.ui) {
+                const totalTime = Date.now() - requestTime;
+                dispatch(
+                    updateResourceUsage({
+                        id: payload.output,
+                        usage: {
+                            __dash_server: totalTime,
+                            __dash_client: totalTime,
+                            __dash_upload: 0,
+                            __dash_download: 0
+                        },
+                        status: STATUS.OK,
+                        result: lastStreamResponse || {},
+                        inputs: payload.inputs,
+                        state: payload.state
+                    })
+                );
+            }
+            return {};
+        }
+
+        // Extract the callback data - structure is {multi: boolean, response: {...}}
+        const callbackData = response.data as CallbackResponseData;
+
+        // Handle sideUpdate if present
+        if (callbackData?.sideUpdate) {
+            dispatch(sideUpdate(callbackData.sideUpdate, payload));
+        }
+
+        // Extract the actual outputs from the response
+        // Format is similar to HTTP path's finishLine function
+        let result: CallbackResponse;
+        const {multi, response: callbackResponse} = callbackData || {};
+
+        if (hooks.request_post) {
+            hooks.request_post(payload, callbackResponse);
+        }
+
+        if (multi) {
+            result = callbackResponse as CallbackResponse;
+        } else {
+            // Single output - convert to the expected format
+            const {output} = payload;
+            const id = output.substr(0, output.lastIndexOf('.'));
+            result = {[id]: (callbackResponse as CallbackResponse)?.props};
+        }
+
+        // Record timing for profiling
+        if (config.ui) {
+            const totalTime = Date.now() - requestTime;
+            dispatch(
+                updateResourceUsage({
+                    id: payload.output,
+                    usage: {
+                        __dash_server: totalTime,
+                        __dash_client: totalTime,
+                        __dash_upload: 0,
+                        __dash_download: 0
+                    },
+                    status: STATUS.OK,
+                    result: result || {},
+                    inputs: payload.inputs,
+                    state: payload.state
+                })
+            );
+        }
+
+        return result || {};
+    } catch (error) {
+        // Handle running off state on error
+        if (runningOff) {
+            dispatch(sideUpdate(runningOff, payload));
+        }
+
+        if (config.ui) {
+            dispatch(
+                updateResourceUsage({
+                    id: payload.output,
+                    status: STATUS.NO_RESPONSE,
+                    result: {},
+                    inputs: payload.inputs,
+                    state: payload.state
+                })
+            );
+        }
+
+        throw error;
+    }
+}
+
 function inputsToDict(inputs_list: any) {
     // Ported directly from _utils.py, inputs_to_dict
     // takes an array of inputs (some inputs may be an array)
@@ -574,6 +1129,23 @@ function inputsToDict(inputs_list: any) {
     return inputs;
 }
 
+function getTriggeredId(triggered: string[]): string | object | undefined {
+    // for regular callbacks,  takes the first triggered prop_id, e.g.  "btn.n_clicks" and returns "btn"
+    // for pattern matching callback, e.g. '{"index":0, "type":"btn"}' and returns {index:0, type: "btn"}'
+    if (triggered && triggered.length) {
+        const trig = triggered[0];
+        let componentId;
+        if (trig.startsWith('{')) {
+            componentId = JSON.parse(
+                trig.substring(0, trig.lastIndexOf('}') + 1)
+            );
+        } else {
+            componentId = trig.split('.')[0];
+        }
+        return componentId;
+    }
+}
+
 export function executeCallback(
     cb: IPrioritizedCallback,
     config: any,
@@ -584,7 +1156,14 @@ export function executeCallback(
     dispatch: any,
     getState: any
 ): IExecutingCallback {
-    const {output, inputs, state, clientside_function, long} = cb.callback;
+    const {
+        output,
+        inputs,
+        state,
+        clientside_function,
+        background,
+        dynamic_creator
+    } = cb.callback;
     try {
         const inVals = fillVals(paths, layout, cb, inputs, 'Input', true);
 
@@ -627,12 +1206,26 @@ export function executeCallback(
         }
 
         const __execute = async (): Promise<CallbackResult> => {
+            const loadingOutputs = flatten(outputs).map(out => ({
+                path: getPath(paths, out.id),
+                property: out.property?.split('@')[0],
+                id: stringifyId(out.id)
+            }));
+            dispatch(loading(loadingOutputs));
             try {
+                const changedPropIds = keys<string>(cb.changedPropIds);
+                const parsedChangedPropsIds = changedPropIds.map(propId => {
+                    if (propId.startsWith('{')) {
+                        return parsePMCId(propId)[0];
+                    }
+                    return propId;
+                });
                 const payload: ICallbackPayload = {
                     output,
                     outputs: isMultiOutputProp(output) ? outputs : outputs[0],
                     inputs: inVals,
-                    changedPropIds: keys(cb.changedPropIds),
+                    changedPropIds,
+                    parsedChangedPropsIds,
                     state: cb.callback.state.length
                         ? fillVals(paths, layout, cb, state, 'State')
                         : undefined
@@ -646,7 +1239,20 @@ export function executeCallback(
                             config,
                             payload
                         );
-                        return {data, payload};
+                        // Layout may have changed
+                        //  Run every output through parsePatchProps against the current layout
+                        const {data: patchedData, patchedOutputs} =
+                            applyPatchedOutputs(
+                                outputs,
+                                paths,
+                                getState().layout,
+                                data
+                            );
+                        return {
+                            data: patchedData,
+                            payload,
+                            ...patchedResultFields(patchedOutputs)
+                        };
                     } catch (error: any) {
                         return {error, payload};
                     }
@@ -657,9 +1263,10 @@ export function executeCallback(
                 let lastError: any;
 
                 const additionalArgs: [string, string, boolean?][] = [];
+                const jsonOutput = JSON.stringify(payload.outputs);
                 values(getState().callbackJobs).forEach(
                     (job: CallbackJobPayload) => {
-                        if (cb.callback.output === job.output) {
+                        if (jsonOutput === job.output) {
                             // Terminate the old jobs that are not completed
                             // set as outdated for the callback promise to
                             // resolve and remove after.
@@ -678,57 +1285,117 @@ export function executeCallback(
                         if (inter.length) {
                             additionalArgs.push(['cancelJob', job.jobId]);
                             if (job.progressDefault) {
-                                sideUpdate(
-                                    job.progressDefault,
-                                    dispatch,
-                                    paths
+                                dispatch(
+                                    sideUpdate(job.progressDefault, payload)
                                 );
                             }
                         }
                     }
                 );
 
+                // Use WebSocket for callbacks when:
+                // 1. Global WebSocket is enabled, OR
+                // 2. Per-callback websocket flag is set (and WebSocket is available)
+                // (but never for background callbacks)
+                const useWebSocket =
+                    !background &&
+                    (isWebSocketEnabled(config) ||
+                        (cb.callback.websocket &&
+                            isWebSocketAvailable(config)));
+
+                // Streaming callbacks ride the single multiplexed downlink when
+                // the server offers it (shared storage enabled) and they are not
+                // already on the WebSocket transport or a background job.
+                const useStream =
+                    !background &&
+                    !useWebSocket &&
+                    cb.callback.stream &&
+                    isStreamMultiplexed(config);
+
                 for (let retry = 0; retry <= MAX_AUTH_RETRIES; retry++) {
                     try {
-                        let data = await handleServerside(
-                            dispatch,
-                            hooks,
-                            newConfig,
-                            payload,
-                            paths,
-                            long,
-                            additionalArgs.length ? additionalArgs : undefined,
-                            getState,
-                            cb.callback.output
-                        );
+                        let data: CallbackResponse;
+
+                        if (useWebSocket) {
+                            // Use WebSocket path for real-time callbacks
+                            data = await handleWebsocketCallback(
+                                dispatch,
+                                hooks,
+                                newConfig,
+                                payload,
+                                cb.callback.running
+                            );
+                        } else if (useStream) {
+                            try {
+                                data = await handleStreamCallback(
+                                    dispatch,
+                                    newConfig,
+                                    payload,
+                                    cb.callback.running
+                                );
+                            } catch (streamErr: any) {
+                                if (streamErr?.message?.includes('403')) {
+                                    data = await handleServerside(
+                                        dispatch,
+                                        hooks,
+                                        newConfig,
+                                        payload,
+                                        background,
+                                        additionalArgs.length
+                                            ? additionalArgs
+                                            : undefined,
+                                        getState,
+                                        cb.callback.running,
+                                        cb.callback.compress_payload,
+                                        cb.callback.compress_threshold
+                                    );
+                                } else {
+                                    throw streamErr;
+                                }
+                            }
+                        } else {
+                            // Use traditional HTTP path
+                            data = await handleServerside(
+                                dispatch,
+                                hooks,
+                                newConfig,
+                                payload,
+                                background,
+                                additionalArgs.length
+                                    ? additionalArgs
+                                    : undefined,
+                                getState,
+                                cb.callback.running,
+                                cb.callback.compress_payload,
+                                cb.callback.compress_threshold
+                            );
+                        }
 
                         if (newHeaders) {
                             dispatch(addHttpHeaders(newHeaders));
                         }
                         // Layout may have changed.
-                        const currentLayout = getState().layout;
-                        flatten(outputs).forEach((out: any) => {
-                            const propName = cleanOutputProp(out.property);
-                            const outputPath = getPath(paths, out.id);
-                            const previousValue = path(
-                                outputPath.concat(['props', propName]),
-                                currentLayout
+                        // Run parsePatchProps against the current layout
+                        const {data: patchedData, patchedOutputs} =
+                            applyPatchedOutputs(
+                                outputs,
+                                paths,
+                                getState().layout,
+                                data
                             );
-                            const dataPath = [stringifyId(out.id), propName];
-                            const outputValue = path(dataPath, data);
-                            if (isPatch(outputValue)) {
-                                if (previousValue === undefined) {
-                                    throw new Error('Cannot patch undefined');
-                                }
-                                data = assocPath(
-                                    dataPath,
-                                    handlePatch(previousValue, outputValue),
-                                    data
-                                );
-                            }
-                        });
 
-                        return {data, payload};
+                        if (dynamic_creator) {
+                            setTimeout(
+                                () => dispatch(requestDependencies()),
+                                0
+                            );
+                        }
+
+                        return {
+                            data: patchedData,
+                            payload,
+                            ...patchedResultFields(patchedOutputs)
+                        };
                     } catch (res: any) {
                         lastError = res;
                         if (
@@ -770,11 +1437,12 @@ export function executeCallback(
                         break;
                     }
                 }
-
                 // we reach here when we run out of retries.
                 return {error: lastError, payload: null};
             } catch (error: any) {
                 return {error, payload: null};
+            } finally {
+                dispatch(loaded(loadingOutputs));
             }
         };
 

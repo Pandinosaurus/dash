@@ -1,3 +1,5 @@
+import {PatchAnalysis} from '../actions/patchAnalysis';
+
 type CallbackId = string | {[key: string]: any};
 
 export interface ICallbackDefinition {
@@ -11,7 +13,15 @@ export interface ICallbackDefinition {
     outputs: ICallbackProperty[];
     prevent_initial_call: boolean;
     state: ICallbackProperty[];
-    long?: LongCallbackInfo;
+    background?: BackgroundCallbackInfo;
+    dynamic_creator?: boolean;
+    running: any;
+    no_output?: boolean;
+    websocket?: boolean;
+    persistent?: boolean;
+    compress_payload?: boolean;
+    compress_threshold?: number;
+    stream?: boolean;
 }
 
 export interface ICallbackProperty {
@@ -69,6 +79,7 @@ export interface IStoredCallback extends IExecutedCallback {
 
 export interface ICallbackPayload {
     changedPropIds: any[];
+    parsedChangedPropsIds: any[];
     inputs: any[];
     output: string;
     outputs: any[];
@@ -79,9 +90,14 @@ export type CallbackResult = {
     data?: CallbackResponse;
     error?: Error;
     payload: ICallbackPayload | null;
+    patchedOutputs?: PatchedOutputs;
 };
 
-export type LongCallbackInfo = {
+export type PatchedOutputs = {
+    [idStr: string]: PatchAnalysis;
+};
+
+export type BackgroundCallbackInfo = {
     interval?: number;
     progress?: any;
     running?: any;
@@ -101,4 +117,13 @@ export type CallbackResponseData = {
     running?: CallbackResponse;
     runningOff?: CallbackResponse;
     cancel?: ICallbackProperty[];
+    dist?: any;
+    sideUpdate?: any;
+    // Streaming callbacks: terminal frame marker and mid-stream error.
+    done?: boolean;
+    error?: {message?: string};
+};
+
+export type SideUpdateOutput = {
+    [key: string]: any;
 };

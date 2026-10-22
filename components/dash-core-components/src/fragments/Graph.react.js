@@ -1,7 +1,5 @@
-import lazyLoadMathJax from '../utils/LazyLoader/mathjax';
+import lazyLoadMathJax from '../utils/LazyLoader/third-party/mathjax';
 import React, {Component} from 'react';
-// /build/withPolyfill for IE11 support - https://github.com/maslianok/react-resize-detector/issues/144
-import ResizeDetector from 'react-resize-detector/build/withPolyfill';
 import {
     equals,
     filter,
@@ -11,10 +9,15 @@ import {
     mergeDeepRight,
     omit,
     type,
+    clone,
 } from 'ramda';
 import PropTypes from 'prop-types';
 import {graphPropTypes, graphDefaultProps} from '../components/Graph.react';
+
 /* global Plotly:true */
+
+import ResizeDetector from '../utils/ResizeDetector';
+import LoadingElement from '../utils/LoadingElement';
 
 /**
  * `autosize: true` causes Plotly.js to conform to the parent element size.
@@ -116,6 +119,26 @@ const filterEventData = (gd, eventData, event) => {
             points[i] = pointData;
         }
         filteredEventData = {points};
+
+        const includeXYVals =
+            (event === 'hover' && gd._fullLayout.hoveranywhere === true) ||
+            (event === 'click' && gd._fullLayout.clickanywhere === true);
+
+        if (includeXYVals) {
+            ['xvals', 'yvals', 'xPixel', 'yPixel'].forEach(key => {
+                if (has(key, eventData)) {
+                    filteredEventData[key] = eventData[key];
+                }
+            });
+
+            if (has('xaxes', eventData)) {
+                filteredEventData.xaxes_id = eventData.xaxes[0]._id;
+            }
+
+            if (has('yaxes', eventData)) {
+                filteredEventData.yaxes_id = eventData.yaxes[0]._id;
+            }
+        }
     } else if (event === 'relayout' || event === 'restyle') {
         /*
          * relayout shouldn't include any big objects
@@ -148,6 +171,8 @@ class PlotlyGraph extends Component {
         this._prevGd = null;
         this._queue = Promise.resolve();
 
+        this.parentElement = React.createRef();
+
         this.bindEvents = this.bindEvents.bind(this);
         this.getConfig = this.getConfig.bind(this);
         this.getConfigOverride = this.getConfigOverride.bind(this);
@@ -173,9 +198,9 @@ class PlotlyGraph extends Component {
         configClone.typesetMath = mathjax;
 
         const figureClone = {
-            data: figure.data,
-            layout: this.getLayout(figure.layout, responsive),
-            frames: figure.frames,
+            data: figure?.data,
+            layout: this.getLayout(figure?.layout, responsive),
+            frames: figure?.frames,
             config: configClone,
         };
 
@@ -309,10 +334,12 @@ class PlotlyGraph extends Component {
         return mergeDeepRight(config, this.getConfigOverride(responsive));
     }
 
-    getLayout(layout, responsive) {
-        if (!layout) {
-            return layout;
+    getLayout(originalLayout, responsive) {
+        if (!originalLayout) {
+            return originalLayout;
         }
+        // Clone layout to avoid mutating the original (important for Patch)
+        const layout = clone(originalLayout);
         const override = this.getLayoutOverride(responsive);
         const {override: prev_override, originals: prev_originals} = this.state;
         // Store the original data that we're about to override
@@ -335,7 +362,7 @@ class PlotlyGraph extends Component {
         for (const key in override) {
             layout[key] = override[key];
         }
-        return layout; // not really a clone
+        return layout;
     }
 
     getConfigOverride(responsive) {
@@ -389,6 +416,7 @@ class PlotlyGraph extends Component {
 
         gd.classList.add('dash-graph--pending');
 
+        // Calling resize enables layout.autosize in plotly.js
         Plotly.Plots.resize(gd)
             .catch(() => {})
             .finally(() => gd.classList.remove('dash-graph--pending'));
@@ -409,6 +437,8 @@ class PlotlyGraph extends Component {
         gd.on('plotly_click', eventData => {
             const clickData = filterEventData(gd, eventData, 'click');
             if (!isNil(clickData)) {
+                // Add timestamp to ensure each click is unique (for DashWrapper deduplication)
+                clickData.timestamp = Date.now();
                 setProps({clickData});
             }
         });
@@ -417,6 +447,8 @@ class PlotlyGraph extends Component {
                 ['event', 'fullAnnotation'],
                 eventData
             );
+            // Add timestamp to ensure each click is unique (for DashWrapper deduplication)
+            clickAnnotationData.timestamp = Date.now();
             setProps({clickAnnotationData});
         });
         gd.on('plotly_hover', eventData => {
@@ -438,6 +470,40 @@ class PlotlyGraph extends Component {
             const relayout = filterEventData(gd, eventData, 'relayout');
             if (!isNil(relayout) && !equals(relayout, relayoutData)) {
                 setProps({relayoutData: relayout});
+            }
+            // Sync user-driven layout changes (pan/zoom ranges, edited
+            // shapes, annotations, ...) from gd.layout back to the figure
+            // prop. This is needed because getLayout() clones layout to
+            // prevent mutation issues, so plotly.js only updates its own
+            // copy and the figure prop (used as the base for Patch
+            // updates) would otherwise go stale.
+            if (eventData && gd.layout) {
+                const {figure = {}} = this.props;
+                const updates = {};
+                for (const eventKey of Object.keys(eventData)) {
+                    // 'xaxis.range[0]' -> 'xaxis', 'shapes[1].x0' -> 'shapes'
+                    const key = eventKey.split('.')[0].split('[')[0];
+                    if (
+                        // autosize/width/height relayouts come from the
+                        // resize machinery, not from user interactions.
+                        !includes(key, ['autosize', 'width', 'height']) &&
+                        !(key in updates) &&
+                        !equals(figure?.layout?.[key], gd.layout[key])
+                    ) {
+                        updates[key] = clone(gd.layout[key]);
+                    }
+                }
+                if (Object.keys(updates).length) {
+                    setProps({
+                        figure: {
+                            ...figure,
+                            layout: {
+                                ...figure?.layout,
+                                ...updates,
+                            },
+                        },
+                    });
+                }
             }
         });
         gd.on('plotly_restyle', eventData => {
@@ -471,10 +537,7 @@ class PlotlyGraph extends Component {
     shouldComponentUpdate(nextProps) {
         return (
             this.props.id !== nextProps.id ||
-            JSON.stringify(this.props.style) !==
-                JSON.stringify(nextProps.style) ||
-            JSON.stringify(this.props.loading_state) !==
-                JSON.stringify(nextProps.loading_state)
+            JSON.stringify(this.props.style) !== JSON.stringify(nextProps.style)
         );
     }
 
@@ -514,28 +577,33 @@ class PlotlyGraph extends Component {
     }
 
     render() {
-        const {className, id, style, loading_state} = this.props;
+        const {className, id, loading_state, style = {}} = this.props;
+        if (this.isResponsive(this.props)) {
+            style.height ||= '100%';
+        }
+
+        let Container = LoadingElement;
+        const containerProps = {
+            className,
+            id,
+            key: id,
+            ref: this.parentElement,
+            style,
+        };
+        if (!window.dash_component_api) {
+            Container = 'div';
+            containerProps['data-dash-is-loading'] =
+                loading_state?.is_loading || undefined;
+        }
 
         return (
-            <div
-                id={id}
-                key={id}
-                data-dash-is-loading={
-                    (loading_state && loading_state.is_loading) || undefined
-                }
-                className={className}
-                style={style}
-            >
+            <Container {...containerProps}>
                 <ResizeDetector
-                    handleHeight={true}
-                    handleWidth={true}
-                    refreshMode="debounce"
-                    refreshOptions={{trailing: true}}
-                    refreshRate={50}
                     onResize={this.graphResize}
+                    targets={[this.parentElement, this.gd]}
                 />
                 <div ref={this.gd} style={{height: '100%', width: '100%'}} />
-            </div>
+            </Container>
         );
     }
 }

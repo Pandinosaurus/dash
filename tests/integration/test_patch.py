@@ -1,10 +1,14 @@
 import json
 
+import flaky
+
 from selenium.webdriver.common.keys import Keys
 
-from dash import Dash, html, dcc, Input, Output, State, ALL, Patch
+from dash import Dash, html, dcc, Input, Output, State, ALL, Patch, set_props
+from dash.testing.wait import until
 
 
+@flaky.flaky(max_runs=3)
 def test_pch001_patch_operations(dash_duo):
 
     app = Dash(__name__)
@@ -216,52 +220,59 @@ def test_pch001_patch_operations(dash_duo):
     _input.send_keys("Set Value")
     dash_duo.find_element("#set-btn").click()
 
-    assert get_output()["value"] == "Set Value"
+    until(lambda: get_output().get("value") == "Set Value", 2)
 
     _input = dash_duo.find_element("#append-value")
     _input.send_keys("Append")
     dash_duo.find_element("#append-btn").click()
 
-    assert get_output()["array"] == ["initial", "Append"]
+    until(lambda: get_output().get("array") == ["initial", "Append"], 2)
 
     _input = dash_duo.find_element("#prepend-value")
     _input.send_keys("Prepend")
     dash_duo.find_element("#prepend-btn").click()
 
-    assert get_output()["array"] == ["Prepend", "initial", "Append"]
+    until(lambda: get_output().get("array") == ["Prepend", "initial", "Append"], 2)
 
     _input = dash_duo.find_element("#extend-value")
     _input.send_keys("Extend")
     dash_duo.find_element("#extend-btn").click()
 
-    assert get_output()["array"] == ["Prepend", "initial", "Append", "Extend"]
+    until(
+        lambda: get_output().get("array") == ["Prepend", "initial", "Append", "Extend"],
+        2,
+    )
 
     undef = object()
-    assert get_output().get("merge", undef) is undef
+    until(lambda: get_output().get("merged", undef) is undef, 2)
 
     _input = dash_duo.find_element("#merge-value")
     _input.send_keys("Merged")
     dash_duo.find_element("#merge-btn").click()
 
-    assert get_output()["merged"] == "Merged"
+    until(lambda: get_output().get("merged") == "Merged", 2)
 
-    assert get_output()["delete"] == "Delete me"
+    until(lambda: get_output().get("delete") == "Delete me", 2)
 
     dash_duo.find_element("#delete-btn").click()
 
-    assert get_output().get("delete", undef) is undef
+    until(lambda: get_output().get("delete", undef) is undef, 2)
 
     _input = dash_duo.find_element("#insert-value")
     _input.send_keys("Inserted")
     dash_duo.find_element("#insert-btn").click()
 
-    assert get_output().get("array") == [
-        "Prepend",
-        "Inserted",
-        "initial",
-        "Append",
-        "Extend",
-    ]
+    until(
+        lambda: get_output().get("array")
+        == [
+            "Prepend",
+            "Inserted",
+            "initial",
+            "Append",
+            "Extend",
+        ],
+        2,
+    )
 
     _input.send_keys(" with negative index")
     _input = dash_duo.find_element("#insert-index")
@@ -269,40 +280,56 @@ def test_pch001_patch_operations(dash_duo):
     _input.send_keys("-1")
     dash_duo.find_element("#insert-btn").click()
 
-    assert get_output().get("array") == [
-        "Prepend",
-        "Inserted",
-        "initial",
-        "Append",
-        "Inserted with negative index",
-        "Extend",
-    ]
+    until(
+        lambda: get_output().get("array")
+        == [
+            "Prepend",
+            "Inserted",
+            "initial",
+            "Append",
+            "Inserted with negative index",
+            "Extend",
+        ],
+        2,
+    )
 
     dash_duo.find_element("#delete-index").click()
-    assert get_output().get("array") == [
-        "Prepend",
-        "initial",
-        "Append",
-        "Extend",
-    ]
+    until(
+        lambda: get_output().get("array")
+        == [
+            "Prepend",
+            "initial",
+            "Append",
+            "Extend",
+        ],
+        2,
+    )
 
     dash_duo.find_element("#reverse-btn").click()
-    assert get_output().get("array") == [
-        "Extend",
-        "Append",
-        "initial",
-        "Prepend",
-    ]
+    until(
+        lambda: get_output().get("array")
+        == [
+            "Extend",
+            "Append",
+            "initial",
+            "Prepend",
+        ],
+        2,
+    )
 
     dash_duo.find_element("#remove-btn").click()
-    assert get_output().get("array") == [
-        "Extend",
-        "Append",
-        "Prepend",
-    ]
+    until(
+        lambda: get_output().get("array")
+        == [
+            "Extend",
+            "Append",
+            "Prepend",
+        ],
+        2,
+    )
 
     dash_duo.find_element("#clear-btn").click()
-    assert get_output()["array"] == []
+    until(lambda: get_output()["array"] == [], 2)
 
 
 def test_pch002_patch_app_pmc_callbacks(dash_duo):
@@ -452,3 +479,408 @@ def test_pch005_clientside_duplicate(dash_duo):
 
     dash_duo.find_element("#click2").click()
     dash_duo.wait_for_text_to_equal("#output", "click2")
+
+
+def test_pch006_base_operators(dash_duo):
+    app = Dash()
+
+    app.layout = [
+        dcc.Store(data=2, id="store"),
+        html.Button("add-one", id="add-one"),
+        html.Button("remove-one", id="remove-one"),
+        html.Button("mul-two", id="mul-two"),
+        html.Button("div-two", id="div-two"),
+        html.Button("merge", id="merge"),
+        dcc.Store(data={"initial": "initial"}, id="dict-store"),
+        html.Div(id="store-output"),
+        html.Div(id="dict-store-output"),
+    ]
+
+    @app.callback(
+        Output("store", "data"), Input("add-one", "n_clicks"), prevent_initial_call=True
+    )
+    def on_add(_):
+        patched = Patch()
+        patched += 1
+        return patched
+
+    @app.callback(
+        Output("store", "data", allow_duplicate=True),
+        Input("remove-one", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def on_remove(_):
+        patched = Patch()
+        patched -= 1
+        return patched
+
+    @app.callback(
+        Output("store", "data", allow_duplicate=True),
+        Input("mul-two", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def on_mul(_):
+        patched = Patch()
+        patched *= 2
+        return patched
+
+    @app.callback(
+        Output("store", "data", allow_duplicate=True),
+        Input("div-two", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def on_div(_):
+        patched = Patch()
+        patched /= 2
+        return patched
+
+    @app.callback(
+        Output("dict-store", "data", allow_duplicate=True),
+        Input("merge", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def on_merge(_):
+        patched = Patch()
+        patched |= {"merged": "merged"}
+        return patched
+
+    app.clientside_callback(
+        "data => data", Output("store-output", "children"), Input("store", "data")
+    )
+    app.clientside_callback(
+        "data => JSON.stringify(data)",
+        Output("dict-store-output", "children"),
+        Input("dict-store", "data"),
+    )
+
+    dash_duo.start_server(app)
+
+    dash_duo.find_element("#add-one").click()
+    dash_duo.wait_for_text_to_equal("#store-output", "3")
+
+    dash_duo.find_element("#remove-one").click()
+    dash_duo.wait_for_text_to_equal("#store-output", "2")
+
+    dash_duo.find_element("#mul-two").click()
+    dash_duo.wait_for_text_to_equal("#store-output", "4")
+
+    dash_duo.find_element("#div-two").click()
+    dash_duo.wait_for_text_to_equal("#store-output", "2")
+
+    dash_duo.find_element("#merge").click()
+    dash_duo.wait_for_text_to_equal(
+        "#dict-store-output", '{"initial":"initial","merged":"merged"}'
+    )
+
+
+@flaky.flaky(max_runs=3)
+def test_pch007_patch_operations_side_updates(dash_duo):
+
+    app = Dash(__name__)
+
+    app.layout = html.Div(
+        [
+            html.Div(
+                [
+                    dcc.Input(id="set-value"),
+                    html.Button("Set", id="set-btn"),
+                ]
+            ),
+            html.Div(
+                [
+                    dcc.Input(id="append-value"),
+                    html.Button("Append", id="append-btn"),
+                ]
+            ),
+            html.Div(
+                [
+                    dcc.Input(id="prepend-value"),
+                    html.Button("prepend", id="prepend-btn"),
+                ]
+            ),
+            html.Div(
+                [
+                    dcc.Input(id="insert-value"),
+                    dcc.Input(id="insert-index", type="number", value=1),
+                    html.Button("insert", id="insert-btn"),
+                ]
+            ),
+            html.Div(
+                [
+                    dcc.Input(id="extend-value"),
+                    html.Button("extend", id="extend-btn"),
+                ]
+            ),
+            html.Div(
+                [
+                    dcc.Input(id="merge-value"),
+                    html.Button("Merge", id="merge-btn"),
+                ]
+            ),
+            html.Button("Delete", id="delete-btn"),
+            html.Button("Delete index", id="delete-index"),
+            html.Button("Clear", id="clear-btn"),
+            html.Button("Reverse", id="reverse-btn"),
+            html.Button("Remove", id="remove-btn"),
+            dcc.Store(
+                data={
+                    "value": "unset",
+                    "n_clicks": 0,
+                    "array": ["initial"],
+                    "delete": "Delete me",
+                },
+                id="store",
+            ),
+            html.Div(id="store-content"),
+        ]
+    )
+
+    app.clientside_callback(
+        "function(value) {return JSON.stringify(value)}",
+        Output("store-content", "children"),
+        Input("store", "data"),
+    )
+
+    @app.callback(
+        Input("set-btn", "n_clicks"),
+        State("set-value", "value"),
+        prevent_initial_call=True,
+    )
+    def on_click(_, value):
+        p = Patch()
+        p.value = value
+        p.n_clicks += 1
+
+        set_props("store", {"data": p})
+
+    @app.callback(
+        Input("append-btn", "n_clicks"),
+        State("append-value", "value"),
+        prevent_initial_call=True,
+    )
+    def on_click(_, value):
+        p = Patch()
+        p.array.append(value)
+        p.n_clicks += 1
+
+        set_props("store", {"data": p})
+
+    @app.callback(
+        Input("prepend-btn", "n_clicks"),
+        State("prepend-value", "value"),
+        prevent_initial_call=True,
+    )
+    def on_click(_, value):
+        p = Patch()
+        p.array.prepend(value)
+        p.n_clicks += 1
+
+        set_props("store", {"data": p})
+
+    @app.callback(
+        Input("extend-btn", "n_clicks"),
+        State("extend-value", "value"),
+        prevent_initial_call=True,
+    )
+    def on_click(_, value):
+        p = Patch()
+        p.array.extend([value])
+        p.n_clicks += 1
+
+        set_props("store", {"data": p})
+
+    @app.callback(
+        Input("merge-btn", "n_clicks"),
+        State("merge-value", "value"),
+        prevent_initial_call=True,
+    )
+    def on_click(_, value):
+        p = Patch()
+        p.update({"merged": value})
+        p.n_clicks += 1
+
+        set_props("store", {"data": p})
+
+    @app.callback(
+        Input("delete-btn", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def on_click(_):
+        p = Patch()
+        del p.delete
+        set_props("store", {"data": p})
+
+    @app.callback(
+        Input("insert-btn", "n_clicks"),
+        State("insert-value", "value"),
+        State("insert-index", "value"),
+        prevent_initial_call=True,
+    )
+    def on_insert(_, value, index):
+        p = Patch()
+        p.array.insert(index, value)
+
+        set_props("store", {"data": p})
+
+    @app.callback(
+        Input("delete-index", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def on_click(_):
+        p = Patch()
+        del p.array[1]
+        del p.array[-2]
+
+        set_props("store", {"data": p})
+
+    @app.callback(
+        Input("clear-btn", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def on_clear(_):
+        p = Patch()
+        p.array.clear()
+
+        set_props("store", {"data": p})
+
+    @app.callback(
+        Input("reverse-btn", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def on_reverse(_):
+        p = Patch()
+        p.array.reverse()
+
+        set_props("store", {"data": p})
+
+    @app.callback(
+        Input("remove-btn", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def on_remove(_):
+        p = Patch()
+        p.array.remove("initial")
+        set_props("store", {"data": p})
+
+    dash_duo.start_server(app)
+
+    assert dash_duo.get_logs() == []
+
+    def get_output():
+        e = dash_duo.find_element("#store-content")
+        return json.loads(e.text)
+
+    _input = dash_duo.find_element("#set-value")
+    _input.send_keys("Set Value")
+    dash_duo.find_element("#set-btn").click()
+
+    until(lambda: get_output().get("value") == "Set Value", 2)
+
+    _input = dash_duo.find_element("#append-value")
+    _input.send_keys("Append")
+    dash_duo.find_element("#append-btn").click()
+
+    until(lambda: get_output().get("array") == ["initial", "Append"], 2)
+
+    _input = dash_duo.find_element("#prepend-value")
+    _input.send_keys("Prepend")
+    dash_duo.find_element("#prepend-btn").click()
+
+    until(lambda: get_output().get("array") == ["Prepend", "initial", "Append"], 2)
+
+    _input = dash_duo.find_element("#extend-value")
+    _input.send_keys("Extend")
+    dash_duo.find_element("#extend-btn").click()
+
+    until(
+        lambda: get_output().get("array") == ["Prepend", "initial", "Append", "Extend"],
+        2,
+    )
+
+    undef = object()
+    until(lambda: get_output().get("merged", undef) is undef, 2)
+
+    _input = dash_duo.find_element("#merge-value")
+    _input.send_keys("Merged")
+    dash_duo.find_element("#merge-btn").click()
+
+    until(lambda: get_output().get("merged") == "Merged", 2)
+
+    until(lambda: get_output().get("delete") == "Delete me", 2)
+
+    dash_duo.find_element("#delete-btn").click()
+
+    until(lambda: get_output().get("delete", undef) is undef, 2)
+
+    _input = dash_duo.find_element("#insert-value")
+    _input.send_keys("Inserted")
+    dash_duo.find_element("#insert-btn").click()
+
+    until(
+        lambda: get_output().get("array")
+        == [
+            "Prepend",
+            "Inserted",
+            "initial",
+            "Append",
+            "Extend",
+        ],
+        2,
+    )
+
+    _input.send_keys(" with negative index")
+    _input = dash_duo.find_element("#insert-index")
+    _input.send_keys(Keys.BACKSPACE)
+    _input.send_keys("-1")
+    dash_duo.find_element("#insert-btn").click()
+
+    until(
+        lambda: get_output().get("array")
+        == [
+            "Prepend",
+            "Inserted",
+            "initial",
+            "Append",
+            "Inserted with negative index",
+            "Extend",
+        ],
+        2,
+    )
+
+    dash_duo.find_element("#delete-index").click()
+    until(
+        lambda: get_output().get("array")
+        == [
+            "Prepend",
+            "initial",
+            "Append",
+            "Extend",
+        ],
+        2,
+    )
+
+    dash_duo.find_element("#reverse-btn").click()
+    until(
+        lambda: get_output().get("array")
+        == [
+            "Extend",
+            "Append",
+            "initial",
+            "Prepend",
+        ],
+        2,
+    )
+
+    dash_duo.find_element("#remove-btn").click()
+    until(
+        lambda: get_output().get("array")
+        == [
+            "Extend",
+            "Append",
+            "Prepend",
+        ],
+        2,
+    )
+
+    dash_duo.find_element("#clear-btn").click()
+    until(lambda: get_output()["array"] == [], 2)

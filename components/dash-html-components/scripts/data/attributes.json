@@ -1,5 +1,14 @@
 {
     "attributes": {
+        "autoFocus": {
+            "elements": [
+                "button",
+                "input",
+                "select",
+                "textarea"
+            ],
+            "description": "The element should be automatically focused after the page loaded."
+        },
         "accept": {
             "elements": [
                 "form",
@@ -11,7 +20,7 @@
             "elements": [
                 "form"
             ],
-            "description": "List of supported charsets."
+            "description": "The character set, which if provided must be \"UTF-8\"."
         },
         "accessKey": {
             "elements": [
@@ -53,15 +62,6 @@
                 "textarea"
             ],
             "description": "Indicates whether controls in this form can by default have their values automatically completed by the browser."
-        },
-        "autoFocus": {
-            "elements": [
-                "button",
-                "input",
-                "select",
-                "textarea"
-            ],
-            "description": "The element should be automatically focused after the page loaded."
         },
         "autoPlay": {
             "elements": [
@@ -226,11 +226,8 @@
                 "button",
                 "fieldset",
                 "input",
-                "label",
-                "meter",
                 "object",
                 "output",
-                "progress",
                 "select",
                 "textarea"
             ],
@@ -248,28 +245,28 @@
                 "button",
                 "input"
             ],
-            "description": "If the button/input is a submit button (e.g. type=\"submit\"), this attribute sets the encoding type to use during form submission. If this attribute is specified, it overrides the enctype attribute of the button's form owner."
+            "description": "If the button/input is a submit button (e.g., type=\"submit\"), this attribute sets the encoding type to use during form submission. If this attribute is specified, it overrides the enctype attribute of the button's form owner."
         },
         "formMethod": {
             "elements": [
                 "button",
                 "input"
             ],
-            "description": "If the button/input is a submit button (e.g. type=\"submit\"), this attribute sets the submission method to use during form submission (GET, POST, etc.). If this attribute is specified, it overrides the method attribute of the button's form owner."
+            "description": "If the button/input is a submit button (e.g., type=\"submit\"), this attribute sets the submission method to use during form submission (GET, POST, etc.). If this attribute is specified, it overrides the method attribute of the button's form owner."
         },
         "formNoValidate": {
             "elements": [
                 "button",
                 "input"
             ],
-            "description": "If the button/input is a submit button (e.g. type=\"submit\"), this boolean attribute specifies that the form is not to be validated when it is submitted. If this attribute is specified, it overrides the novalidate attribute of the button's form owner."
+            "description": "If the button/input is a submit button (e.g., type=\"submit\"), this boolean attribute specifies that the form is not to be validated when it is submitted. If this attribute is specified, it overrides the novalidate attribute of the button's form owner."
         },
         "formTarget": {
             "elements": [
                 "button",
                 "input"
             ],
-            "description": "If the button/input is a submit button (e.g. type=\"submit\"), this attribute specifies the browsing context (for example, tab, window, or inline frame) in which to display the response that is received after submitting the form. If this attribute is specified, it overrides the target attribute of the button's form owner."
+            "description": "If the button/input is a submit button (e.g., type=\"submit\"), this attribute specifies the browsing context (for example, tab, window, or inline frame) in which to display the response that is received after submitting the form. If this attribute is specified, it overrides the target attribute of the button's form owner."
         },
         "headers": {
             "elements": [
@@ -335,7 +332,7 @@
                 "link",
                 "script"
             ],
-            "description": "Specifies a Subresource Integrity value that allows browsers to verify what they fetch."
+            "description": "This attribute contains one or more hashes of the resource, and is used to ensure that the content of the resource is what the developer expects it to be, and has not been replaced with a malicious copy in a supply chain attack. See Subresource Integrity."
         },
         "inputMode": {
             "elements": [
@@ -491,6 +488,12 @@
                 "textarea"
             ],
             "description": "Provides a hint to the user of what can be entered in the field."
+        },
+        "playsInline": {
+            "elements": [
+                "video"
+            ],
+            "description": "A Boolean attribute indicating that the video is to be played \"inline\"; that is, within the element's playback area. Note that the absence of this attribute does not imply that the video will always be played in fullscreen."
         },
         "poster": {
             "elements": [
@@ -668,6 +671,12 @@
             ],
             "description": "Defines CSS styles which will override styles previously set."
         },
+        "summary": {
+            "elements": [
+                "table"
+            ],
+            "description": ""
+        },
         "tabIndex": {
             "elements": [
                 "Globalattribute"
@@ -745,22 +754,24 @@
         }
     },
     "elements": {
-        "form": [
-            "accept",
-            "acceptCharset",
-            "action",
-            "autoComplete",
-            "encType",
-            "method",
+        "button": [
+            "autoFocus",
+            "disabled",
+            "form",
+            "formAction",
+            "formEncType",
+            "formMethod",
+            "formNoValidate",
+            "formTarget",
             "name",
-            "noValidate",
-            "target"
+            "type",
+            "value"
         ],
         "input": [
+            "autoFocus",
             "accept",
             "alt",
             "autoComplete",
-            "autoFocus",
             "capture",
             "checked",
             "disabled",
@@ -789,6 +800,43 @@
             "useMap",
             "value",
             "width"
+        ],
+        "select": [
+            "autoFocus",
+            "autoComplete",
+            "disabled",
+            "form",
+            "multiple",
+            "name",
+            "required",
+            "size"
+        ],
+        "textarea": [
+            "autoFocus",
+            "autoComplete",
+            "cols",
+            "disabled",
+            "form",
+            "inputMode",
+            "maxLength",
+            "minLength",
+            "name",
+            "placeholder",
+            "readOnly",
+            "required",
+            "rows",
+            "wrap"
+        ],
+        "form": [
+            "accept",
+            "acceptCharset",
+            "action",
+            "autoComplete",
+            "encType",
+            "method",
+            "name",
+            "noValidate",
+            "target"
         ],
         "Globalattribute": [
             "accessKey",
@@ -846,45 +894,6 @@
             "src",
             "type"
         ],
-        "select": [
-            "autoComplete",
-            "autoFocus",
-            "disabled",
-            "form",
-            "multiple",
-            "name",
-            "required",
-            "size"
-        ],
-        "textarea": [
-            "autoComplete",
-            "autoFocus",
-            "cols",
-            "disabled",
-            "form",
-            "inputMode",
-            "maxLength",
-            "minLength",
-            "name",
-            "placeholder",
-            "readOnly",
-            "required",
-            "rows",
-            "wrap"
-        ],
-        "button": [
-            "autoFocus",
-            "disabled",
-            "form",
-            "formAction",
-            "formEncType",
-            "formMethod",
-            "formNoValidate",
-            "formTarget",
-            "name",
-            "type",
-            "value"
-        ],
         "audio": [
             "autoPlay",
             "controls",
@@ -901,6 +910,7 @@
             "height",
             "loop",
             "muted",
+            "playsInline",
             "poster",
             "preload",
             "src",
@@ -993,27 +1003,12 @@
             "target"
         ],
         "label": [
-            "htmlFor",
-            "form"
+            "htmlFor"
         ],
         "output": [
             "htmlFor",
             "form",
             "name"
-        ],
-        "meter": [
-            "form",
-            "high",
-            "low",
-            "max",
-            "min",
-            "optimum",
-            "value"
-        ],
-        "progress": [
-            "form",
-            "max",
-            "value"
         ],
         "canvas": [
             "height",
@@ -1025,6 +1020,14 @@
             "type",
             "width"
         ],
+        "meter": [
+            "high",
+            "low",
+            "max",
+            "min",
+            "optimum",
+            "value"
+        ],
         "base": [
             "href",
             "target"
@@ -1034,6 +1037,10 @@
         ],
         "marquee": [
             "loop"
+        ],
+        "progress": [
+            "max",
+            "value"
         ],
         "source": [
             "media",
@@ -1069,6 +1076,9 @@
         ],
         "colgroup": [
             "span"
+        ],
+        "table": [
+            "summary"
         ],
         "menu": [
             "type"

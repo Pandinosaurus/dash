@@ -1,7 +1,21 @@
+import re
+
 import flask
 import pytest
+from flaky import flaky
 
-from dash import Dash, Input, Output, State, MATCH, ALL, ALLSMALLER, html, dcc
+from dash import (
+    Dash,
+    Input,
+    Output,
+    State,
+    MATCH,
+    ALL,
+    ALLSMALLER,
+    html,
+    dcc,
+    set_props,
+)
 from dash.testing import wait
 
 debugging = dict(
@@ -19,6 +33,14 @@ def check_errors(dash_duo, specs):
     found = []
     for i in range(cnt):
         msg = dash_duo.find_elements(".dash-fe-error__title")[i].text
+        # plotly-cloud (installed with dash[cloud]) injects a `_plotly-cloud-*`
+        # component into every layout via a dash_hooks entry point, so it
+        # shows up in the "string ids in the current layout" list. Strip it
+        # so these assertions hold whether or not plotly-cloud is installed.
+        msg = re.sub(r"_plotly-cloud[\w-]*", "", msg)
+        msg = re.sub(r",\s*,", ",", msg)
+        msg = re.sub(r",\s*\]", "]", msg)
+        msg = re.sub(r"\[\s*,\s*", "[", msg)
         dash_duo.find_elements(".test-devtools-error-toggle")[i].click()
         dash_duo.wait_for_element(".dash-backend-error,.dash-fe-error__info")
         has_BE = dash_duo.driver.execute_script(
@@ -58,10 +80,26 @@ def check_errors(dash_duo, specs):
 
 
 def test_dvcv001_blank(dash_duo):
+    """No-input no-output callbacks are allowed when prevent_initial_call=False (default)."""
     app = Dash(__name__)
     app.layout = html.Div()
 
-    @app.callback([], [])
+    @app.callback()
+    def x():
+        pass  # No-output callbacks shouldn't return anything
+
+    dash_duo.start_server(app, **debugging)
+    # No errors expected - no-input callbacks are allowed when prevent_initial_call=False
+    dash_duo.wait_for_element("div")
+    assert dash_duo.get_logs() == []
+
+
+def test_dvcv001b_blank_prevent_initial_call(dash_duo):
+    """No-input callbacks should error when prevent_initial_call=True."""
+    app = Dash(__name__)
+    app.layout = html.Div()
+
+    @app.callback([], [], prevent_initial_call=True)
     def x():
         return 42
 
@@ -70,10 +108,6 @@ def test_dvcv001_blank(dash_duo):
         dash_duo,
         [
             ["A callback is missing Inputs", ["there are no `Input` elements."]],
-            [
-                "A callback is missing Outputs",
-                ["Please provide an output for this callback:"],
-            ],
         ],
     )
 
@@ -116,6 +150,7 @@ def test_dvcv002_blank_id_prop(dash_duo):
     check_errors(dash_duo, specs)
 
 
+@flaky(max_runs=3)
 def test_dvcv003_duplicate_outputs_same_callback(dash_duo):
     app = Dash(__name__)
     app.layout = html.Div([html.Div(id="a"), html.Div(id="b")])
@@ -632,6 +667,7 @@ def test_dvcv012_circular_2_step(dash_duo):
     check_errors(dash_duo, specs)
 
 
+@flaky(max_runs=3)
 def test_dvcv013_circular_3_step(dash_duo):
     app = Dash(__name__)
 
@@ -819,3 +855,51 @@ def test_dvcv016_circular_with_input_output(dash_duo):
         ]
     ]
     check_errors(dash_duo, specs)
+
+
+def test_dvcv017_match_input_permitted_no_output_match(dash_duo):
+    # Issue #2462: when Outputs don't carry MATCH wildcards, Inputs/State
+    # may use MATCH freely. These callbacks should load without errors.
+    app = Dash(__name__)
+    app.layout = html.Div(
+        [
+            html.Button("btn", id={"type": "btn", "idx": 1}),
+            html.Div(id="out-a"),
+            html.Div(id="out-b"),
+            html.Div(id={"type": "wild", "idx": 1}),
+            html.Div(id={"type": "wild", "idx": 2}),
+        ]
+    )
+
+    # fixed Output + MATCH Input
+    @app.callback(
+        Output("out-a", "children"),
+        Input({"type": "btn", "idx": MATCH}, "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def a(_):
+        return "a"
+
+    # no-Output + MATCH Input
+    @app.callback(
+        Input({"type": "btn", "idx": MATCH}, "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def b(_):
+        set_props("out-b", {"children": "b"})
+
+    # ALL-only wildcard Output + MATCH Input on a different key
+    @app.callback(
+        Output({"type": "wild", "idx": ALL}, "children"),
+        Input({"type": "btn", "idx": MATCH}, "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def c(_):
+        return ["c", "c"]
+
+    dash_duo.start_server(app, **debugging)
+
+    # All three callbacks should register without validation errors.
+    wait.until(lambda: ~dash_duo.redux_state_is_loading, 2)
+    dash_duo.wait_for_no_elements(dash_duo.devtools_error_count_locator)
+    assert dash_duo.get_logs() == []

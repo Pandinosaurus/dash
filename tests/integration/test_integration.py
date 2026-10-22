@@ -2,12 +2,8 @@ import datetime
 import flask
 import json
 import pytest
-import re
 
 from bs4 import BeautifulSoup
-
-import dash_dangerously_set_inner_html
-import dash_flow_example
 
 import dash
 from dash import Dash, html, dcc, Input, Output
@@ -48,65 +44,56 @@ def test_inin003_wildcard_data_attributes(dash_duo):
     assert dash_duo.get_logs() == []
 
 
-def test_inin004_no_props_component(dash_duo):
-    app = Dash()
-    app.layout = html.Div(
-        [
-            dash_dangerously_set_inner_html.DangerouslySetInnerHTML(
-                """
-            <h1>No Props Component</h1>
-        """
-            )
-        ],
-        id="app",
+def test_inin005_meta_tags_social_media(dash_duo):
+    app = Dash(
+        title="my title",
+        description="my description",
+        image="my_app.png",
     )
+    app.layout = html.Div(["Hey! Meta tags!"])
 
     dash_duo.start_server(app)
 
-    assert dash_duo.get_logs() == []
-    assert dash_duo.find_element("h1").text == "No Props Component"
-
-    inner = dash_duo.find_element("#app").get_property("innerHTML")
-    expected = "<div> <h1>No Props Component</h1> </div>"
-    assert re.sub("\\s+", " ", inner) == expected
-
-
-def test_inin005_flow_component(dash_duo):
-    app = Dash()
-
-    app.layout = html.Div(
-        [
-            dash_flow_example.ExampleReactComponent(
-                id="react", value="my-value", label="react component"
-            ),
-            dash_flow_example.ExampleFlowComponent(
-                id="flow", value="my-value", label="flow component"
-            ),
-            html.Hr(),
-            html.Div(id="output"),
-        ]
+    assert (
+        dash_duo.find_element('meta[name="description"]').get_attribute("content")
+        == "my description"
     )
 
-    @app.callback(
-        Output("output", "children"), [Input("react", "value"), Input("flow", "value")]
+    assert (
+        dash_duo.find_element('meta[property="twitter:title"]').get_attribute("content")
+        == "my title"
     )
-    def display_output(react_value, flow_value):
-        return html.Div(
-            [
-                "You have entered {} and {}".format(react_value, flow_value),
-                html.Hr(),
-                html.Label("Flow Component Docstring"),
-                html.Pre(dash_flow_example.ExampleFlowComponent.__doc__),
-                html.Hr(),
-                html.Label("React PropTypes Component Docstring"),
-                html.Pre(dash_flow_example.ExampleReactComponent.__doc__),
-                html.Div(id="waitfor"),
-            ]
+
+    assert (
+        dash_duo.find_element('meta[property="twitter:description"]').get_attribute(
+            "content"
         )
+        == "my description"
+    )
 
-    dash_duo.start_server(app)
-    dash_duo.wait_for_element("#waitfor")
-    dash_duo.percy_snapshot(name="flowtype")
+    assert (
+        dash_duo.find_element('meta[property="twitter:image"]')
+        .get_attribute("content")
+        .endswith("/assets/my_app.png")
+    )
+
+    assert (
+        dash_duo.find_element('meta[property="og:title"]').get_attribute("content")
+        == "my title"
+    )
+
+    assert (
+        dash_duo.find_element('meta[property="og:description"]').get_attribute(
+            "content"
+        )
+        == "my description"
+    )
+
+    assert (
+        dash_duo.find_element('meta[property="og:image"]')
+        .get_attribute("content")
+        .endswith("/assets/my_app.png")
+    )
 
 
 def test_inin006_meta_tags(dash_duo):
@@ -366,7 +353,7 @@ def test_inin026_graphs_in_tabs_do_not_share_state(dash_duo):
     until(lambda: '"label": 3' in dash_duo.find_element("#graph2_info").text, timeout=3)
 
 
-def test_inin027_multi_page_without_pages_folder(dash_duo):
+def test_inin027_multi_page_without_pages_folder(dash_duo, clear_pages_state):
     app = Dash(__name__, pages_folder="")
 
     # test for storing arbitrary keyword arguments: An `id` prop is defined for every page
@@ -427,3 +414,147 @@ def test_inin027_multi_page_without_pages_folder(dash_duo):
     del dash.page_registry["not_found_404"]
 
     assert not dash_duo.get_logs()
+
+
+def test_inin028_layout_as_list(dash_duo):
+    app = Dash()
+
+    app.layout = [
+        "string1",
+        "string2",
+        html.Div("one", id="one"),
+        html.Div("two", id="two"),
+        html.Button("direct", id="direct"),
+        html.Div(id="direct-output"),
+        html.Div([html.Button("nested", id="nested"), html.Div(id="nested-output")]),
+    ]
+
+    @app.callback(
+        Output("direct-output", "children"),
+        Input("direct", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def on_direct_click(n_clicks):
+        return f"Clicked {n_clicks} times"
+
+    @app.callback(
+        Output("nested-output", "children"),
+        Input("nested", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def on_nested_click(n_clicks):
+        return f"Clicked {n_clicks} times"
+
+    dash_duo.start_server(app)
+
+    dash_duo.wait_for_contains_text("#react-entry-point", "string1")
+    dash_duo.wait_for_contains_text("#react-entry-point", "string2")
+
+    dash_duo.wait_for_text_to_equal("#one", "one")
+    dash_duo.wait_for_text_to_equal("#two", "two")
+
+    dash_duo.wait_for_element("#direct").click()
+    dash_duo.wait_for_text_to_equal("#direct-output", "Clicked 1 times")
+
+    dash_duo.wait_for_element("#nested").click()
+    dash_duo.wait_for_text_to_equal("#nested-output", "Clicked 1 times")
+
+
+def test_inin029_layout_as_list_with_pages(dash_duo, clear_pages_state):
+    app = Dash(use_pages=True, pages_folder="")
+
+    dash.register_page(
+        "list-pages",
+        "/",
+        layout=[
+            html.Div("one", id="one"),
+            html.Div("two", id="two"),
+            html.Button("direct", id="direct"),
+            html.Div(id="direct-output"),
+            html.Div(
+                [html.Button("nested", id="nested"), html.Div(id="nested-output")]
+            ),
+        ],
+    )
+
+    @app.callback(
+        Output("direct-output", "children"),
+        Input("direct", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def on_direct_click(n_clicks):
+        return f"Clicked {n_clicks} times"
+
+    @app.callback(
+        Output("nested-output", "children"),
+        Input("nested", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def on_nested_click(n_clicks):
+        return f"Clicked {n_clicks} times"
+
+    dash_duo.start_server(app)
+
+    dash_duo.wait_for_text_to_equal("#one", "one")
+    dash_duo.wait_for_text_to_equal("#two", "two")
+
+    dash_duo.wait_for_element("#direct").click()
+    dash_duo.wait_for_text_to_equal("#direct-output", "Clicked 1 times")
+
+    dash_duo.wait_for_element("#nested").click()
+    dash_duo.wait_for_text_to_equal("#nested-output", "Clicked 1 times")
+
+
+def test_inin030_add_startup_route(dash_duo):
+    url = "my-new-route"
+
+    def my_route_f():
+        return "hello"
+
+    Dash.add_startup_route(url, my_route_f, ["POST"])
+
+    import requests
+
+    app = Dash(__name__)
+    Dash.STARTUP_ROUTES = []
+    app.layout = html.Div("Hello World")
+    dash_duo.start_server(app)
+
+    url = f"{dash_duo.server_url}{app.config.requests_pathname_prefix}_dash_startup_route/{url}"
+    response = requests.post(url)
+    assert response.status_code == 200
+    assert response.text == "hello"
+
+
+def test_inin031_initial_value_set_back(dash_duo):
+    # Test for regression on the initial value to be able to
+    # set back to initial after changing again.
+    app = Dash(__name__)
+
+    app.layout = html.Div(
+        [
+            dcc.Dropdown(
+                id="dropdown",
+                options=["Toronto", "Montréal", "Vancouver"],
+                value="Toronto",
+                searchable=False,
+            ),
+            html.Div(id="output"),
+        ]
+    )
+
+    @app.callback(Output("output", "children"), [Input("dropdown", "value")])
+    def callback(value):
+        return f"You have selected {value}"
+
+    dash_duo.start_server(app)
+
+    dash_duo.wait_for_text_to_equal("#output", "You have selected Toronto")
+
+    dash_duo.select_dcc_dropdown("#dropdown", "Vancouver")
+    dash_duo.wait_for_text_to_equal("#output", "You have selected Vancouver")
+
+    dash_duo.select_dcc_dropdown("#dropdown", "Toronto")
+    dash_duo.wait_for_text_to_equal("#output", "You have selected Toronto")
+
+    assert dash_duo.get_logs() == []

@@ -5,7 +5,6 @@ import pytest
 import time
 
 import numpy as np
-import werkzeug
 
 from dash_test_components import (
     AsyncComponent,
@@ -25,12 +24,11 @@ from dash import (
     callback_context,
 )
 from dash.exceptions import PreventUpdate
+from dash.testing.wait import until
 from tests.integration.utils import json_engine
 
 
 def test_cbsc001_simple_callback(dash_duo):
-    lock = Lock()
-
     app = Dash(__name__)
     app.layout = html.Div(
         [
@@ -42,9 +40,8 @@ def test_cbsc001_simple_callback(dash_duo):
 
     @app.callback(Output("output-1", "children"), [Input("input", "value")])
     def update_output(value):
-        with lock:
-            call_count.value = call_count.value + 1
-            return value
+        call_count.value = call_count.value + 1
+        return value
 
     dash_duo.start_server(app)
 
@@ -53,9 +50,16 @@ def test_cbsc001_simple_callback(dash_duo):
     input_ = dash_duo.find_element("#input")
     dash_duo.clear_input(input_)
 
-    for key in "hello world":
-        with lock:
-            input_.send_keys(key)
+    # Gate each keystroke on the previous callback having executed. If two
+    # keystroke callbacks are in the renderer's `requested` queue at once it
+    # coalesces them into a single request (see requestedCallbacks.ts), which
+    # undercounts invocations. Waiting for each keystroke to be processed
+    # keeps the one-callback-per-keystroke invariant the assertion relies on.
+    until(lambda: call_count.value == 2, timeout=3)
+
+    for i, key in enumerate("hello world"):
+        input_.send_keys(key)
+        until(lambda i=i: call_count.value == 3 + i, timeout=3)
 
     dash_duo.wait_for_text_to_equal("#output-1", "hello world")
 
@@ -100,6 +104,7 @@ def test_cbsc002_callbacks_generating_children(dash_duo):
     pad_input, pad_div = dash_duo.dash_innerhtml_dom.select_one(
         "#output > div"
     ).contents
+    pad_input = pad_input.next  # get the input element, not the wrapper
 
     assert (
         pad_input.attrs["value"] == "sub input initial value"
@@ -114,9 +119,10 @@ def test_cbsc002_callbacks_generating_children(dash_duo):
     paths = dash_duo.redux_state_paths
     assert paths["objs"] == {}
     assert paths["strs"] == {
-        "input": ["props", "children", 0],
-        "output": ["props", "children", 1],
+        "input": ["components", "props", "children", 0],
+        "output": ["components", "props", "children", 1],
         "sub-input-1": [
+            "components",
             "props",
             "children",
             1,
@@ -127,6 +133,7 @@ def test_cbsc002_callbacks_generating_children(dash_duo):
             0,
         ],
         "sub-output-1": [
+            "components",
             "props",
             "children",
             1,
@@ -305,11 +312,6 @@ def test_cbsc006_array_of_objects(dash_duo, engine):
             dash_duo.select_dcc_dropdown("#dd", "opt{}".format(i))
 
 
-@pytest.mark.xfail(
-    condition=werkzeug.__version__ in ("2.1.0", "2.1.1"),
-    reason="Bug with 204 and Transfer-Encoding",
-    strict=False,
-)
 @pytest.mark.parametrize("refresh", [False, True])
 def test_cbsc007_parallel_updates(refresh, dash_duo):
     # This is a funny case, that seems to mostly happen with dcc.Location
@@ -419,9 +421,13 @@ def test_cbsc008_wildcard_prop_callbacks(dash_duo):
     for key in "hello world":
         with lock:
             input1.send_keys(key)
+        time.sleep(0.05)  # Small delay to prevent callback debouncing
 
     dash_duo.wait_for_text_to_equal("#output-1", "hello world")
     assert dash_duo.find_element("#output-1").get_attribute("data-cb") == "hello world"
+
+    # Wait for all callbacks to complete
+    time.sleep(0.1)
 
     # an initial call, one for clearing the input
     # and one for each hello world character
@@ -789,5 +795,320 @@ def test_cbsc018_callback_ndarray_output(dash_duo):
         return np.array([[1, 2, 3], [4, 5, 6]], np.int32)
 
     dash_duo.start_server(app)
+
+    assert dash_duo.get_logs() == []
+
+
+def test_cbsc019_callback_running(dash_duo):
+    lock = Lock()
+    app = Dash(__name__)
+
+    app.layout = html.Div(
+        [
+            html.Div("off", id="running"),
+            html.Button("start", id="start"),
+            html.Div(id="output"),
+        ]
+    )
+
+    @app.callback(
+        Output("output", "children"),
+        Input("start", "n_clicks"),
+        running=[[Output("running", "children"), html.B("on", id="content"), "off"]],
+        prevent_initial_call=True,
+    )
+    def on_click(_):
+        with lock:
+            pass
+        return "done"
+
+    dash_duo.start_server(app)
+    with lock:
+        dash_duo.find_element("#start").click()
+        dash_duo.wait_for_text_to_equal("#content", "on")
+
+    dash_duo.wait_for_text_to_equal("#output", "done")
+    dash_duo.wait_for_text_to_equal("#running", "off")
+
+
+def test_cbsc020_callback_running_non_existing_component(dash_duo):
+    lock = Lock()
+    app = Dash(__name__, suppress_callback_exceptions=True)
+
+    app.layout = html.Div(
+        [
+            html.Button("start", id="start"),
+            html.Div(id="output"),
+        ]
+    )
+
+    @app.callback(
+        Output("output", "children"),
+        Input("start", "n_clicks"),
+        running=[
+            [
+                Output("non_existent_component", "children"),
+                html.B("on", id="content"),
+                "off",
+            ]
+        ],
+        prevent_initial_call=True,
+    )
+    def on_click(_):
+        with lock:
+            pass
+        return "done"
+
+    dash_duo.start_server(app)
+    with lock:
+        dash_duo.find_element("#start").click()
+
+    dash_duo.wait_for_text_to_equal("#output", "done")
+
+
+def test_cbsc021_callback_running_non_existing_component(dash_duo):
+    lock = Lock()
+    app = Dash(__name__)
+
+    app.layout = html.Div(
+        [
+            html.Button("start", id="start"),
+            html.Div(id="output"),
+        ]
+    )
+
+    @app.callback(
+        Output("output", "children"),
+        Input("start", "n_clicks"),
+        running=[
+            [
+                Output("non_existent_component", "children"),
+                html.B("on", id="content"),
+                "off",
+            ]
+        ],
+        prevent_initial_call=True,
+    )
+    def on_click(_):
+        with lock:
+            pass
+        return "done"
+
+    dash_duo.start_server(
+        app,
+        debug=True,
+        use_reloader=False,
+        use_debugger=True,
+        dev_tools_hot_reload=False,
+    )
+    with lock:
+        dash_duo.find_element("#start").click()
+
+    dash_duo.wait_for_text_to_equal("#output", "done")
+    error_title = "ID running component not found in layout"
+    error_message = [
+        "Component defined in running keyword not found in layout.",
+        'Component id: "non_existent_component"',
+        "This ID was used in the callback(s) for Output(s):",
+        "output.children",
+        "You can suppress this exception by setting",
+        "`suppress_callback_exceptions=True`.",
+    ]
+    # The error should show twice, once for trying to set running on and once for
+    # turning it off.
+    dash_duo.wait_for_text_to_equal(dash_duo.devtools_error_count_locator, "2")
+    for error in dash_duo.find_elements(".dash-fe-error__title"):
+        assert error.text == error_title
+    for error_text in dash_duo.find_elements(".dash-backend-error"):
+        assert all(line in error_text for line in error_message)
+
+
+def test_cbsc022_no_output_callback_initial_call(dash_duo):
+    """Test that no-output callbacks fire on initial load."""
+
+    call_count = Value("i", 0)
+
+    app = Dash(__name__)
+    app.layout = html.Div(
+        [
+            html.Button("Click", id="btn", n_clicks=0),
+            html.Div(id="output"),
+        ]
+    )
+
+    @app.callback(
+        Input("btn", "n_clicks"),
+    )
+    def no_output_callback(n_clicks):
+        call_count.value += 1
+
+    @app.callback(
+        Output("output", "children"),
+        Input("btn", "n_clicks"),
+    )
+    def with_output_callback(n_clicks):
+        return f"Clicks: {n_clicks}"
+
+    dash_duo.start_server(app)
+
+    # Wait for initial render
+    dash_duo.wait_for_text_to_equal("#output", "Clicks: 0")
+
+    # No-output callback should have fired on initial load
+    assert call_count.value == 1, "no-output callback should fire on initial load"
+
+    # Click button
+    dash_duo.find_element("#btn").click()
+    dash_duo.wait_for_text_to_equal("#output", "Clicks: 1")
+
+    # No-output callback should have fired again
+    assert call_count.value == 2, "no-output callback should fire on click"
+
+    assert dash_duo.get_logs() == []
+
+
+def test_cbsc023_no_input_callback_initial_call(dash_duo):
+    """Test that no-input callbacks fire on initial load (issue #3411)."""
+    app = Dash(__name__)
+    app.layout = html.Div(
+        [
+            dcc.Store(id="store", data="initial"),
+            html.Div(id="output"),
+        ]
+    )
+
+    @app.callback(
+        Output("output", "children"),
+        State("store", "data"),
+    )
+    def no_input_callback(data):
+        return f"Data: {data}"
+
+    dash_duo.start_server(app)
+
+    # No-input callback should fire on initial load
+    dash_duo.wait_for_text_to_equal("#output", "Data: initial")
+
+    assert dash_duo.get_logs() == []
+
+
+def test_cbsc024_no_input_no_output_callback_initial_call(dash_duo):
+    """Test that callbacks with no input and no output fire on initial load."""
+    from multiprocessing import Value
+
+    call_count = Value("i", 0)
+
+    app = Dash(__name__)
+    app.layout = html.Div(
+        [
+            html.Div(id="output", children="Waiting..."),
+        ]
+    )
+
+    @app.callback()
+    def no_input_no_output_callback():
+        call_count.value += 1
+        print(f"No-input no-output callback fired: {call_count.value}")
+
+    dash_duo.start_server(app)
+
+    # Give it time to fire
+    dash_duo.wait_for_element("#output")
+    time.sleep(0.5)
+
+    # Callback should have fired on initial load
+    assert (
+        call_count.value == 1
+    ), "no-input no-output callback should fire on initial load"
+
+    assert dash_duo.get_logs() == []
+
+
+def test_cbsc025_multiple_no_input_no_output_callbacks(dash_duo):
+    """Test that multiple no-input no-output callbacks all fire on initial load."""
+    from multiprocessing import Value
+
+    call_count_1 = Value("i", 0)
+    call_count_2 = Value("i", 0)
+    call_count_3 = Value("i", 0)
+
+    app = Dash(__name__)
+    app.layout = html.Div(
+        [
+            html.Div(id="output", children="Waiting..."),
+        ]
+    )
+
+    @app.callback()
+    def first_callback():
+        call_count_1.value += 1
+
+    @app.callback()
+    def second_callback():
+        call_count_2.value += 1
+
+    @app.callback()
+    def third_callback():
+        call_count_3.value += 1
+
+    dash_duo.start_server(app)
+
+    # Give callbacks time to fire
+    dash_duo.wait_for_element("#output")
+    time.sleep(0.5)
+
+    # All callbacks should have fired on initial load
+    assert call_count_1.value == 1, "first callback should fire"
+    assert call_count_2.value == 1, "second callback should fire"
+    assert call_count_3.value == 1, "third callback should fire"
+
+    assert dash_duo.get_logs() == []
+
+
+def test_cbsc026_no_input_with_duplicate_outputs(dash_duo):
+    """Test no-input callbacks with duplicate outputs."""
+    from multiprocessing import Value
+
+    call_count_1 = Value("i", 0)
+    call_count_2 = Value("i", 0)
+
+    app = Dash(__name__)
+    app.layout = html.Div(
+        [
+            dcc.Store(id="store", data="initial"),
+            html.Div(id="output", children="Waiting..."),
+        ]
+    )
+
+    @app.callback(
+        Output("output", "children"),
+        State("store", "data"),
+    )
+    def first_no_input_callback(data):
+        call_count_1.value += 1
+        return f"First: {data}"
+
+    @app.callback(
+        Output("output", "children", allow_duplicate=True),
+        State("store", "data"),
+        prevent_initial_call="initial_duplicate",
+    )
+    def second_no_input_callback(data):
+        call_count_2.value += 1
+        return f"Second: {data}"
+
+    dash_duo.start_server(app)
+
+    # Give callbacks time to fire
+    dash_duo.wait_for_element("#output")
+    time.sleep(0.5)
+
+    # Both callbacks should have fired on initial load
+    assert call_count_1.value == 1, "first no-input callback should fire"
+    assert call_count_2.value == 1, "second no-input callback should fire"
+
+    # Output should contain result from one of the callbacks
+    output_text = dash_duo.find_element("#output").text
+    assert "initial" in output_text, "output should contain data from store"
 
     assert dash_duo.get_logs() == []

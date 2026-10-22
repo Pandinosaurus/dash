@@ -1,0 +1,1365 @@
+name: Dash Testing
+
+on:
+  push:
+    branches:
+      - dev
+      - master
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+
+  changes_filter:
+    name: Detect Relevant Path Changes
+    runs-on: ubuntu-latest
+    outputs:
+      table_paths_changed: ${{ steps.filter.outputs.table_related_paths }}
+      background_cb_changed: ${{ steps.filter.outputs.background_paths }}
+      backend_cb_changed: ${{ steps.filter.outputs.backend_paths }}
+      dcc_paths_changed: ${{ steps.filter.outputs.dcc_related_paths }}
+      html_paths_changed: ${{ steps.filter.outputs.html_related_paths }}
+      websocket_changed: ${{ steps.filter.outputs.websocket_paths }}
+      streaming_changed: ${{ steps.filter.outputs.streaming_paths }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Detect changed files for table tests
+        id: filter # Give an ID to this step to reference its outputs
+        uses: dorny/paths-filter@v3
+        with:
+          # Every job installs from requirements/ and setup.py and runs under
+          # the shared lint and pytest config, so a change there must run every
+          # job. A dependency bump once skipped the table and dcc jobs and only
+          # failed after merging to dev.
+          filters: |
+            shared_paths: &shared_paths
+              - 'requirements/**'
+              - 'setup.py'
+              - 'pytest.ini'
+              - '.flake8'
+              - '.pylintrc'
+              - 'package.json'
+              - 'package-lock.json'
+              - 'dash/testing/**'
+              - '.github/workflows/testing.yml'
+            table_related_paths:
+              - *shared_paths
+              - 'components/dash-table/**'
+              - 'dash/dash-renderer/**'
+            dcc_related_paths:
+              - *shared_paths
+              - 'components/dash-core-components/**'
+              - 'dash/dash-renderer/**'
+            html_related_paths:
+              - *shared_paths
+              - 'components/dash-html-components/**'
+              - 'dash/dash-renderer/**'
+            background_paths:
+              - *shared_paths
+              - 'dash/background_callback/**'
+              - 'dash/dash-renderer/**'
+              - 'dash/_callback.py'
+              - 'dash/_callback_context.py'
+              - 'tests/background_callback/**'
+              - 'tests/async_tests/**'
+            backend_paths:
+              - *shared_paths
+              - 'dash/backends/**'
+              - 'tests/backend_tests/**'
+            websocket_paths:
+              - *shared_paths
+              - 'dash/backends/_fastapi.py'
+              - 'dash/backends/_quart.py'
+              - 'dash/backends/base_server.py'
+              - 'dash/_callback.py'
+              - 'dash/_callback_context.py'
+              - 'dash/_hooks.py'
+              - 'dash/dash.py'
+              - '@dash-websocket-worker/**'
+              - 'dash/dash-renderer/src/**'
+              - 'tests/websocket/**'
+            streaming_paths:
+              - *shared_paths
+              - 'dash/_callback.py'
+              - 'dash/_streaming.py'
+              - 'dash/_callback_context.py'
+              - 'dash/backends/**'
+              - 'dash/dash-renderer/src/**'
+              - 'tests/streaming/**'
+
+  lint-unit:
+    name: Lint & Unit Tests (Python ${{ matrix.python-version }})
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.12"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install Node.js dependencies
+        run: npm ci
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+          cache-dependency-path: requirements/*.txt
+
+      - name: Download built Dash packages
+        uses: actions/download-artifact@v4
+        with:
+          name: dash-packages
+          path: packages/
+
+      - name: Download built component folders for linting
+        uses: actions/download-artifact@v4
+        with:
+          name: dash-components
+          path: ${{ github.workspace }}/dash
+
+      - name: Install Dash packages
+        run: |
+          python -m pip install --upgrade pip wheel
+          python -m pip install "setuptools<80.0.0"
+          find packages -name dash-*.whl -print -exec sh -c 'pip install "{}[dev,ci,testing,diskcache]"' \;
+
+      - name: Install dash-renderer dependencies
+        working-directory: dash/dash-renderer
+        run: npm ci
+
+      - name: Setup virtual display
+        uses: ./.github/actions/setup-virtual-display
+
+      - name: Run lint
+        env:
+          PYLINT_EXTRA_ARGS: ${{ matrix.python-version == '3.9' && '--ignored-modules=mcp' || '' }}
+        run: npm run lint
+
+      - name: Run unit tests
+        run: npm run citest.unit
+
+  build:
+    name: Build Dash Package
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      artifact_name: dash-packages
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js for frontend build
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install NPM dependencies
+        run: npm ci
+
+      - name: Set up Python for build
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "setuptools<80.0.0"
+          python -m pip install build wheel
+          python -m pip install -e .[dev,ci]
+      
+      - name: Build Dash
+        run: npm run build
+
+      - name: Build Dash sdist and wheel
+        run: |
+          # This command will invoke hatchling (via hatch_dash.py) which includes building JS assets
+          python -m build --sdist --wheel
+          echo "Built packages:"
+          ls -lhR dist/
+          mkdir packages
+          cp dist/*.whl packages
+
+      - name: Upload Dash packages as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dash-packages # This name will be used by dependent jobs to download
+          path: packages/ # Upload the contents of the dist directory
+          retention-days: 1 # Keep artifact for 1 day (adjust as needed)
+
+      - name: Upload built component folders for linting
+        uses: actions/upload-artifact@v4
+        with:
+          name: dash-components
+          path: |
+            dash/dcc/
+            dash/html/
+            dash/dash_table/
+          retention-days: 1
+
+  test-typing:
+    name: Typing Tests
+    runs-on: ubuntu-latest
+    if: github.ref_name != 'master'
+    needs: build
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install Node.js dependencies
+        run: npm ci
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: requirements/*.txt
+      
+      - name: Download built Dash packages
+        uses: actions/download-artifact@v4
+        with:
+          name: dash-packages
+          path: packages/
+      
+      - name: Install Dash packages
+        run: |
+          python -m pip install --upgrade pip wheel
+          python -m pip install "setuptools<80.0.0"
+          find packages -name dash-*.whl -print -exec sh -c 'pip install "{}[ci,testing,dev,diskcache]"' \;
+
+      - name: Build/Setup test components
+        run: npm run setup-tests.py  # TODO build the packages and save them to packages/ in build job
+
+      - name: Run typing tests
+        run: |
+          pytest \
+            tests/compliance/test_typing.py \
+            tests/compliance/test_callback_typing.py
+
+  shared-storage:
+    name: Run Shared Storage Tests (Python ${{ matrix.python-version }})
+    needs: build
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.12"]
+
+    # Redis service for the RedisSharedStorage backend.
+    services:
+      redis:
+        image: redis:6
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      REDIS_URL: redis://localhost:6379
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install Node.js dependencies
+        run: npm ci
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+          cache-dependency-path: requirements/*.txt
+
+      - name: Download built Dash packages
+        uses: actions/download-artifact@v4
+        with:
+          name: dash-packages
+          path: packages/
+
+      - name: Install Dash packages
+        run: |
+          python -m pip install --upgrade pip wheel
+          python -m pip install "setuptools<80.0.0"
+          find packages -name dash-*.whl -print -exec sh -c 'pip install "{}[ci,testing,dev,diskcache,redis]"' \;
+
+      - name: Setup Chrome and ChromeDriver
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
+      - name: Verify Redis connection
+        run: python -c "import redis; redis.Redis(host='localhost', port=6379).ping(); print('Redis OK')"
+
+      - name: Build/Setup test components
+        run: npm run setup-tests.py
+
+      - name: Run shared-storage tests
+        run: pytest --headless tests/shared_storage -v
+
+  background-callbacks:
+    name: Run Background & Async Callback Tests (Python ${{ matrix.python-version }})
+    needs: [build, changes_filter]
+    if: |
+      (github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/dev')) ||
+      needs.changes_filter.outputs.background_cb_changed == 'true'
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.12"]
+
+    # Service container for Redis
+    services:
+      redis:
+        image: redis:6
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      # Set REDIS_URL for your application/tests
+      # The service 'redis' will be available on localhost (or redis) at port 6379
+      REDIS_URL: redis://localhost:6379
+      # These suites can leave non-daemon workers alive after pytest finishes,
+      # hanging the step at interpreter shutdown; hard-exit once the session is
+      # done (see pytest_sessionfinish in tests/conftest.py).
+      DASH_TEST_FORCE_EXIT: "1"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+      
+      - name: Install Node.js dependencies
+        run: npm ci
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+          cache-dependency-path: requirements/*.txt
+
+      - name: Download built Dash packages
+        uses: actions/download-artifact@v4
+        with:
+          name: dash-packages
+          path: packages/
+      
+      - name: Install Dash packages
+        run: |
+          python -m pip install --upgrade pip wheel
+          python -m pip install "setuptools<78.0.0"
+          find packages -name dash-*.whl -print -exec sh -c 'pip install "{}[async,ci,testing,dev,celery,diskcache]"' \;
+
+      - name: Setup Chrome and ChromeDriver
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
+      - name: Verify Redis connection
+        run: |
+          python -c "import redis; r = redis.Redis(host='localhost', port=6379, db=0); r.ping(); print('Successfully connected to Redis!')"
+
+      - name: Build/Setup test components
+        run: npm run setup-tests.py
+
+      - name: Setup test directory
+        run: |
+          mkdir bgtests
+          cp -r tests bgtests/tests
+          cd bgtests
+          touch __init__.py
+          mkdir -p test-reports
+
+      - name: Run Background Callback Tests
+        timeout-minutes: 15
+        run: |
+          cd bgtests
+          pytest --headless --nopercyfinalize --junitxml=test-reports/junit_background.xml tests/background_callback -v -s
+
+      - name: Cleanup background processes
+        if: always()
+        run: |
+          pkill -f celery || true
+          pkill -f "dash" || true
+          sleep 2
+
+      - name: Run Async Callback Tests
+        timeout-minutes: 15
+        run: |
+          cd bgtests
+          pytest --headless --nopercyfinalize --junitxml=test-reports/junit_async.xml tests/async_tests -v -s
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: background-test-results-py${{ matrix.python-version }}
+          path: bgtests/test-reports/
+          retention-days: 7
+
+  backend-tests:
+    name: Run Backend Callback Tests (Python ${{ matrix.python-version }})
+    needs: [build, changes_filter]
+    if: |
+      (github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/dev')) ||
+      needs.changes_filter.outputs.backend_cb_changed == 'true'
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.12"]
+
+    services:
+      redis:
+        image: redis:6
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      REDIS_URL: redis://localhost:6379
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install Node.js dependencies
+        run: npm ci
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+          cache-dependency-path: requirements/*.txt
+
+      - name: Download built Dash packages
+        uses: actions/download-artifact@v4
+        with:
+          name: dash-packages
+          path: packages/
+
+      - name: Install Dash packages
+        run: |
+          python -m pip install --upgrade pip wheel
+          python -m pip install "setuptools<80.0.0"
+          find packages -name dash-*.whl -print -exec sh -c 'pip install "{}[async,ci,testing,dev,celery,diskcache,fastapi,quart]"' \;
+
+      - name: Setup Chrome and ChromeDriver
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
+      - name: Build/Setup test components
+        run: npm run setup-tests.py
+
+      - name: Run Backend Callback Tests
+        run: |
+          mkdir bgtests
+          cp -r tests bgtests/tests
+          cd bgtests
+          touch __init__.py
+          pytest --headless --nopercyfinalize tests/backend_tests -v -s
+
+  table-unit:
+    name: Table Unit/Lint Tests (Python ${{ matrix.python-version }})
+    needs: [build, changes_filter]
+    if: |
+      (github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/dev')) ||
+      needs.changes_filter.outputs.table_paths_changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install Node.js dependencies
+        run: npm ci
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+          cache-dependency-path: requirements/*.txt
+
+      - name: Download built Dash packages
+        uses: actions/download-artifact@v4
+        with:
+          name: dash-packages # Must match the name used in the 'build' job's upload step
+          path: packages/ # Download to a local 'dist' directory
+
+      - name: Install Dash packages
+        run: |
+          python -m pip install --upgrade pip wheel
+          python -m pip install "setuptools<80.0.0"
+          find packages -name dash-*.whl -print -exec sh -c 'pip install "{}[ci,testing,dev]"' \;
+      
+      - name: Lint
+        run: |
+          cd components/dash-table
+          npm ci
+          npm run lint
+
+      - name: Unit
+        run: |
+          cd components/dash-table
+          npm run test.unit
+
+  table-server:
+    name: Table Server Tests (Group ${{ matrix.test-group }})
+    needs: [build, changes_filter]
+    # Conditional execution:
+    # OR if the 'changes_filter' job detected changes in 'table_related_paths'.
+    if: |
+      (github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/dev')) ||
+      needs.changes_filter.outputs.table_paths_changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12"]
+        test-group: ["1", "2", "3"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install Node.js dependencies
+        run: npm ci
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+          cache-dependency-path: requirements/*.txt
+
+      - name: Download built Dash packages
+        uses: actions/download-artifact@v4
+        with:
+          name: dash-packages
+          path: packages/
+
+      - name: Install Dash packages
+        run: |
+          python -m pip install --upgrade pip wheel
+          python -m pip install "setuptools<80.0.0"
+          find packages -name dash-*.whl -print -exec sh -c 'pip install "{}[ci,testing,dev]"' \;
+
+      - name: Setup Chrome and ChromeDriver
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
+      - name: Run Table Server Tests
+        run: |
+          cd components/dash-table
+          pytest --nopercyfinalize --headless --junitxml=test-reports/junit_table.xml --splits 3 --group ${{ matrix.test-group }}
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: table-server-results-group${{ matrix.test-group }}
+          path: components/dash-table/test-reports/
+          retention-days: 7
+
+  websocket-tests:
+    name: WebSocket Tests (Python ${{ matrix.python-version }})
+    needs: [build, changes_filter]
+    if: |
+      (github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/dev')) ||
+      needs.changes_filter.outputs.websocket_changed == 'true'
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.12"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install Node.js dependencies
+        run: npm ci
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+          cache-dependency-path: requirements/*.txt
+
+      - name: Download built Dash packages
+        uses: actions/download-artifact@v4
+        with:
+          name: dash-packages
+          path: packages/
+
+      - name: Install Dash packages
+        run: |
+          python -m pip install --upgrade pip wheel
+          python -m pip install "setuptools<80.0.0"
+          find packages -name dash-*.whl -print -exec sh -c 'pip install "{}[ci,testing,dev,fastapi,quart]"' \;
+
+      - name: Setup Chrome and ChromeDriver
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
+      - name: Build/Setup test components
+        run: npm run setup-tests.py
+
+      - name: Run WebSocket tests
+        run: |
+          mkdir wstests
+          cp -r tests wstests/tests
+          cd wstests
+          touch __init__.py
+          pytest --headless --nopercyfinalize tests/websocket -v -s
+
+  streaming-tests:
+    name: Streaming Callback Tests (Python ${{ matrix.python-version }})
+    needs: [build, changes_filter]
+    if: |
+      (github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/dev')) ||
+      needs.changes_filter.outputs.streaming_changed == 'true'
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.12"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install Node.js dependencies
+        run: npm ci
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+          cache-dependency-path: requirements/*.txt
+
+      - name: Download built Dash packages
+        uses: actions/download-artifact@v4
+        with:
+          name: dash-packages
+          path: packages/
+
+      - name: Install Dash packages
+        # Streaming callbacks are async generators; the async extra pulls in
+        # flask[async], which they require on the Flask backend.
+        run: |
+          python -m pip install --upgrade pip wheel
+          python -m pip install "setuptools<80.0.0"
+          find packages -name dash-*.whl -print -exec sh -c 'pip install "{}[async,ci,testing,dev,fastapi,quart]"' \;
+
+      - name: Setup Chrome and ChromeDriver
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
+      - name: Build/Setup test components
+        run: npm run setup-tests.py
+
+      - name: Run streaming tests
+        run: |
+          mkdir streamtests
+          cp -r tests streamtests/tests
+          cd streamtests
+          touch __init__.py
+          pytest --headless --nopercyfinalize tests/streaming -v -s
+
+  test-main:
+    name: Main Dash Tests (Python ${{ matrix.python-version }}, React ${{ matrix.react-version }}, Group ${{ matrix.test-group }})
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.12"]
+        react-version: ["18.3.1", "19.2.4"]
+        test-group: ["1", "2", "3"]
+
+    env:
+      REACT_VERSION: ${{ matrix.react-version }}
+      PERCY_TOKEN: ${{ matrix.python-version == '3.12' && matrix.react-version == '18.3.1' && secrets.PERCY_TOKEN || '' }}
+      PERCY_ENABLE: ${{ matrix.python-version == '3.12' && matrix.react-version == '18.3.1' && '1' || '0' }}
+      PERCY_PARALLEL_TOTAL: -1
+      # Pin the build identity so every shard joins the same parallel build and
+      # Percy links it to the PR. Auto-detection otherwise uses the ephemeral
+      # merge SHA (refs/pull/N/merge), so the build never shows up on the PR.
+      PERCY_PARALLEL_NONCE: ${{ github.run_id }}-${{ github.run_attempt }}
+      PERCY_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+      PERCY_BRANCH: ${{ github.head_ref || github.ref_name }}
+      PERCY_PULL_REQUEST: ${{ github.event.pull_request.number }}
+      PERCY_TARGET_BRANCH: ${{ github.base_ref }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install Node.js dependencies
+        run: npm ci
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+          cache-dependency-path: requirements/*.txt
+
+      - name: Download built Dash packages
+        uses: actions/download-artifact@v4
+        with:
+          name: dash-packages
+          path: packages/
+
+      - name: Install Dash packages
+        run: |
+          python -m pip install --upgrade pip wheel
+          python -m pip install "setuptools<80.0.0"
+          find packages -name dash-*.whl -print -exec sh -c 'pip install "{}[ci,testing,dev,celery,diskcache]"' \;
+
+      - name: Setup Chrome and ChromeDriver
+        id: setup-chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
+      - name: Setup virtual display
+        uses: ./.github/actions/setup-virtual-display
+
+      - name: Build/Setup test components
+        run: npm run setup-tests.py
+
+      - name: Run main integration tests
+        if: matrix.python-version != '3.12' || matrix.react-version != '18.3.1'
+        run: pytest --headless --nopercyfinalize --junitxml=test-reports/junit_intg.xml tests/integration --splits 3 --group ${{ matrix.test-group }}
+
+      - name: Run main integration tests with Percy
+        if: matrix.python-version == '3.12' && matrix.react-version == '18.3.1'
+        uses: ./.github/actions/percy-exec
+        with:
+          command: pytest --headless --nopercyfinalize --junitxml=test-reports/junit_intg.xml tests/integration --splits 3 --group ${{ matrix.test-group }}
+          percy-token: ${{ secrets.PERCY_TOKEN }}
+          browser-executable: ${{ steps.setup-chrome.outputs.chrome-path }}
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-main-results-py${{ matrix.python-version }}-react${{ matrix.react-version }}-group${{ matrix.test-group }}
+          path: test-reports/
+          retention-days: 7
+
+      - name: Upload dash artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-main-dash-artifacts-py${{ matrix.python-version }}-react${{ matrix.react-version }}-group${{ matrix.test-group }}
+          path: /tmp/dash_artifacts
+          retention-days: 7
+          if-no-files-found: ignore
+
+  html-test:
+    name: HTML Components Tests (Python ${{ matrix.python-version }}, React ${{ matrix.react-version }})
+    needs: [build, changes_filter]
+    if: |
+      (github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/dev')) ||
+      needs.changes_filter.outputs.html_paths_changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.12"]
+        react-version: ["18.3.1", "19.2.4"]
+
+    env:
+      REACT_VERSION: ${{ matrix.react-version }}
+      PERCY_TOKEN: ${{ matrix.python-version == '3.12' && matrix.react-version == '18.3.1' && secrets.PERCY_TOKEN || '' }}
+      PERCY_ENABLE: ${{ matrix.python-version == '3.12' && matrix.react-version == '18.3.1' && '1' || '0' }}
+      PERCY_PARALLEL_TOTAL: -1
+      # Pin the build identity so every shard joins the same parallel build and
+      # Percy links it to the PR. Auto-detection otherwise uses the ephemeral
+      # merge SHA (refs/pull/N/merge), so the build never shows up on the PR.
+      PERCY_PARALLEL_NONCE: ${{ github.run_id }}-${{ github.run_attempt }}
+      PERCY_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+      PERCY_BRANCH: ${{ github.head_ref || github.ref_name }}
+      PERCY_PULL_REQUEST: ${{ github.event.pull_request.number }}
+      PERCY_TARGET_BRANCH: ${{ github.base_ref }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install Node.js dependencies
+        run: npm ci
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+          cache-dependency-path: requirements/*.txt
+
+      - name: Download built Dash packages
+        uses: actions/download-artifact@v4
+        with:
+          name: dash-packages
+          path: packages/
+
+      - name: Install Dash packages
+        run: |
+          python -m pip install --upgrade pip wheel
+          python -m pip install "setuptools<80.0.0"
+          find packages -name dash-*.whl -print -exec sh -c 'pip install "{}[ci,testing,dev]"' \;
+
+      - name: Setup Chrome and ChromeDriver
+        id: setup-chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
+      - name: Setup virtual display
+        uses: ./.github/actions/setup-virtual-display
+
+      - name: Install HTML components dependencies
+        working-directory: components/dash-html-components
+        run: npm ci
+
+      - name: Run HTML components tests
+        if: matrix.python-version != '3.12' || matrix.react-version != '18.3.1'
+        working-directory: components/dash-html-components
+        run: pytest --headless --nopercyfinalize --junitxml=test-reports/junit_html.xml
+
+      - name: Run HTML components tests with Percy
+        if: matrix.python-version == '3.12' && matrix.react-version == '18.3.1'
+        uses: ./.github/actions/percy-exec
+        with:
+          command: pytest --headless --nopercyfinalize --junitxml=test-reports/junit_html.xml
+          percy-token: ${{ secrets.PERCY_TOKEN }}
+          browser-executable: ${{ steps.setup-chrome.outputs.chrome-path }}
+          working-directory: components/dash-html-components
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: html-test-results-py${{ matrix.python-version }}-react${{ matrix.react-version }}
+          path: components/dash-html-components/test-reports/
+          retention-days: 7
+
+      - name: Upload dash artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: html-test-dash-artifacts-py${{ matrix.python-version }}-react${{ matrix.react-version }}
+          path: /tmp/dash_artifacts
+          retention-days: 7
+          if-no-files-found: ignore
+
+  build-windows:
+    name: Build on Windows
+    runs-on: windows-latest
+    needs: build
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Node.js dependencies
+        run: npm ci
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "setuptools<80.0.0"
+          python -m pip install -e .[dev,ci]
+
+      - name: Build dash-renderer
+        working-directory: dash/dash-renderer
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build dash-html-components
+        working-directory: components/dash-html-components
+        run: |
+          npm ci
+          npm run build
+
+      - name: Download built component folders
+        uses: actions/download-artifact@v4
+        with:
+          name: dash-components
+          path: ${{ github.workspace }}/dash
+
+      - name: Run Windows-specific unit tests
+        run: python -m pytest tests/unit/test_resources.py
+
+  dcc-lint:
+    name: DCC Lint Tests (Python ${{ matrix.python-version }})
+    needs: [build, changes_filter]
+    if: |
+      (github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/dev')) ||
+      needs.changes_filter.outputs.dcc_paths_changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.12"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+          cache-dependency-path: requirements/*.txt
+
+      - name: Download built Dash packages
+        uses: actions/download-artifact@v4
+        with:
+          name: dash-packages
+          path: packages/
+
+      - name: Install Dash packages
+        run: |
+          python -m pip install --upgrade pip wheel
+          python -m pip install "setuptools<80.0.0"
+          find packages -name dash-*.whl -print -exec sh -c 'pip install "{}[ci,testing,dev]"' \;
+
+      - name: Lint DCC
+        run: |
+          cd components/dash-core-components
+          npm ci
+          npm run lint
+
+  dcc-test:
+    name: DCC Integration Tests (Python ${{ matrix.python-version }}, React ${{ matrix.react-version }}, Group ${{ matrix.test-group }})
+    needs: [build, changes_filter]
+    if: |
+      (github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/dev')) ||
+      needs.changes_filter.outputs.dcc_paths_changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.12"]
+        react-version: ["18.3.1", "19.2.4"]
+        test-group: ["1", "2", "3"]
+
+    env:
+      REACT_VERSION: ${{ matrix.react-version }}
+      PERCY_TOKEN: ${{ matrix.python-version == '3.12' && matrix.react-version == '18.3.1' && secrets.PERCY_TOKEN || '' }}
+      PERCY_ENABLE: ${{ matrix.python-version == '3.12' && matrix.react-version == '18.3.1' && '1' || '0' }}
+      PERCY_PARALLEL_TOTAL: -1
+      # Pin the build identity so every shard joins the same parallel build and
+      # Percy links it to the PR. Auto-detection otherwise uses the ephemeral
+      # merge SHA (refs/pull/N/merge), so the build never shows up on the PR.
+      PERCY_PARALLEL_NONCE: ${{ github.run_id }}-${{ github.run_attempt }}
+      PERCY_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+      PERCY_BRANCH: ${{ github.head_ref || github.ref_name }}
+      PERCY_PULL_REQUEST: ${{ github.event.pull_request.number }}
+      PERCY_TARGET_BRANCH: ${{ github.base_ref }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install Node.js dependencies
+        run: npm ci
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+          cache-dependency-path: requirements/*.txt
+
+      - name: Download built Dash packages
+        uses: actions/download-artifact@v4
+        with:
+          name: dash-packages
+          path: packages/
+
+      - name: Install Dash packages
+        run: |
+          python -m pip install --upgrade pip wheel
+          python -m pip install "setuptools<80.0.0"
+          find packages -name dash-*.whl -print -exec sh -c 'pip install "{}[ci,testing,dev,celery,diskcache]"' \;
+
+      - name: Setup Chrome and ChromeDriver
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
+      - name: Setup virtual display
+        uses: ./.github/actions/setup-virtual-display
+
+      - name: Remove DCC Python package and run tests
+        run: |
+          rm -rf components/dash-core-components/dash_core_components
+          cd components/dash-core-components
+          npm ci
+          npm run test:jest
+          pytest --headless --nopercyfinalize --junitxml=test-reports/junit_intg.xml --junitprefix="components.dash-core-components" tests/integration --splits 3 --group ${{ matrix.test-group }}
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dcc-test-results-py${{ matrix.python-version }}-react${{ matrix.react-version }}-group${{ matrix.test-group }}
+          path: components/dash-core-components/test-reports/
+          retention-days: 7
+
+      - name: Upload dash artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dcc-dash-artifacts-py${{ matrix.python-version }}-react${{ matrix.react-version }}-group${{ matrix.test-group }}
+          path: /tmp/dash_artifacts
+          retention-days: 7
+          if-no-files-found: ignore
+
+  table-visual-test:
+    name: Dash Table Visual Tests
+    needs: [build, changes_filter]
+    if: |
+      (github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/dev')) ||
+      needs.changes_filter.outputs.table_paths_changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      PERCY_TOKEN: ${{ secrets.PERCY_TOKEN_TABLE }}
+      PERCY_ENABLE: '1'
+      # Note: percy-storybook auto-finalizes, don't use PERCY_PARALLEL_TOTAL here
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install Node.js dependencies
+        run: npm ci
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: requirements/*.txt
+
+      - name: Download built Dash packages
+        uses: actions/download-artifact@v4
+        with:
+          name: dash-packages
+          path: packages/
+
+      - name: Install Dash packages
+        run: |
+          python -m pip install --upgrade pip wheel
+          python -m pip install "setuptools<80.0.0"
+          find packages -name dash-*.whl -print -exec sh -c 'pip install "{}[ci,testing,dev]"' \;
+
+      - name: Setup Chrome and ChromeDriver
+        id: setup-chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
+      - name: Setup virtual display
+        uses: ./.github/actions/setup-virtual-display
+
+      - name: Install Table test dependencies
+        working-directory: components/dash-table
+        run: npm ci
+
+      - name: Run Table visual tests
+        if: env.PERCY_TOKEN != ''
+        working-directory: components/dash-table
+        # percy-storybook bundles an old puppeteer whose Chromium is absent on
+        # the runner; point it at the system Chrome installed above.
+        env:
+          PUPPETEER_EXECUTABLE_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
+        run: npm run test.visual
+
+      - name: Skip Table visual tests (fork PR)
+        if: env.PERCY_TOKEN == ''
+        run: echo "::notice::Skipping Percy table visual tests (no token available - likely a fork PR)"
+
+      - name: Upload dash artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: table-visual-test-dash-artifacts
+          path: /tmp/dash_artifacts
+          retention-days: 7
+          if-no-files-found: ignore
+
+  percy-finalize:
+    name: Finalize Percy Snapshots
+    needs: [test-main, dcc-test, html-test]
+    runs-on: ubuntu-latest
+    if: always()
+    env:
+      PERCY_TOKEN: ${{ secrets.PERCY_TOKEN }}
+      # Must match the snapshot jobs so finalize targets the same parallel build
+      # and the result is attached to the PR head commit, not the merge SHA.
+      PERCY_PARALLEL_NONCE: ${{ github.run_id }}-${{ github.run_attempt }}
+      PERCY_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+      PERCY_BRANCH: ${{ github.head_ref || github.ref_name }}
+      PERCY_PULL_REQUEST: ${{ github.event.pull_request.number }}
+      PERCY_TARGET_BRANCH: ${{ github.base_ref }}
+    steps:
+      - name: Finalize Main Percy Build
+        if: |
+          env.PERCY_TOKEN != '' && (
+            needs.test-main.result != 'skipped' ||
+            needs.dcc-test.result != 'skipped' ||
+            needs.html-test.result != 'skipped'
+          )
+        run: |
+          npm install -g @percy/cli
+          npx percy build:finalize
+
+      - name: Skip Percy finalize (fork PR)
+        if: env.PERCY_TOKEN == ''
+        run: echo "::notice::Skipping Percy finalize (no token available - likely a fork PR)"
+
+  test-report:
+    name: Consolidated Test Report
+    needs: [lint-unit, test-main, dcc-test, html-test, table-server, background-callbacks, test-typing]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all test results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: '*-results-*'
+          path: test-results
+          merge-multiple: false
+
+      - name: List downloaded results
+        run: find test-results -name "*.xml" -type f 2>/dev/null || echo "No XML files found"
+
+      - name: Publish Test Report
+        uses: dorny/test-reporter@v1
+        # Skip for fork PRs and Dependabot PRs - both run with a read-only
+        # GITHUB_TOKEN, so they're handled by post-test-status.yml workflow_run.
+        if: always() && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]'))
+        with:
+          name: Test Results Summary
+          path: 'test-results/**/*.xml'
+          reporter: java-junit
+          fail-on-error: false
+          fail-on-empty: false
+          list-suites: 'failed'
+          list-tests: 'failed'
+          max-annotations: '50'
+
+      - name: Generate Summary
+        if: always()
+        run: |
+          echo "## 📊 Test Results Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Lint & Unit Tests | ${{ needs.lint-unit.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Main Integration Tests | ${{ needs.test-main.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| DCC Tests | ${{ needs.dcc-test.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| HTML Tests | ${{ needs.html-test.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Table Server Tests | ${{ needs.table-server.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Background Callbacks | ${{ needs.background-callbacks.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Typing Tests | ${{ needs.test-typing.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "📁 Detailed test reports are available in the artifacts section above." >> $GITHUB_STEP_SUMMARY
+
+      - name: Check for failures
+        if: always()
+        run: |
+          if [[ "${{ needs.lint-unit.result }}" == "failure" ]] || \
+             [[ "${{ needs.test-main.result }}" == "failure" ]] || \
+             [[ "${{ needs.dcc-test.result }}" == "failure" ]] || \
+             [[ "${{ needs.html-test.result }}" == "failure" ]] || \
+             [[ "${{ needs.table-server.result }}" == "failure" ]] || \
+             [[ "${{ needs.background-callbacks.result }}" == "failure" ]] || \
+             [[ "${{ needs.test-typing.result }}" == "failure" ]]; then
+            echo "One or more required jobs failed"
+            exit 1
+          fi
+
+  artifacts:
+    name: Store Build Artifacts
+    needs: [build, percy-finalize]
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/master' ||
+       github.ref == 'refs/heads/dev' ||
+       startsWith(github.ref, 'refs/tags/'))
+
+    steps:
+      - name: Download built Dash packages
+        uses: actions/download-artifact@v4
+        with:
+          name: dash-packages
+          path: packages/
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dash-build-artifacts-${{ github.sha }}
+          path: packages/
+          retention-days: 90

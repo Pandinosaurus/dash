@@ -1,33 +1,50 @@
-import json
-from dash.development.base_component import Component
+from enum import Enum
+from typing import Union, Sequence, Any
 
+from .development.base_component import Component
 from ._validate import validate_callback
 from ._grouping import flatten_grouping, make_grouping_by_index
+from ._utils import stringify_id
+
+ComponentIdType = Union[str, Component, dict]
 
 
-class _Wildcard:  # pylint: disable=too-few-public-methods
-    def __init__(self, name):
-        self._name = name
+class Wildcard(Enum):
+    MATCH = "MATCH"
+    ALL = "ALL"
+    ALLSMALLER = "ALLSMALLER"
 
     def __str__(self):
-        return self._name
+        return self.value
 
     def __repr__(self):
-        return f"<{self}>"
+        return f"<{self.value}>"
 
-    def to_json(self):
+    def to_json(self) -> str:
         # used in serializing wildcards - arrays are not allowed as
         # id values, so make the wildcards look like length-1 arrays.
-        return f'["{self._name}"]'
+        return f'["{self.value}"]'
 
 
-MATCH = _Wildcard("MATCH")
-ALL = _Wildcard("ALL")
-ALLSMALLER = _Wildcard("ALLSMALLER")
+MATCH = Wildcard.MATCH
+ALL = Wildcard.ALL
+ALLSMALLER = Wildcard.ALLSMALLER
+
+# Backward compatibility alias — the class was renamed from _Wildcard to
+# Wildcard in Dash 3.4.  Third-party packages (e.g. dash-pydantic-form)
+# still import the old private name.
+_Wildcard = Wildcard
 
 
 class DashDependency:  # pylint: disable=too-few-public-methods
-    def __init__(self, component_id, component_property):
+    component_id: ComponentIdType
+    allow_duplicate: bool
+    component_property: str
+    allowed_wildcards: Sequence[Wildcard]
+    allow_optional: bool
+    partial_pattern: bool
+
+    def __init__(self, component_id: ComponentIdType, component_property: str):
 
         if isinstance(component_id, Component):
             self.component_id = component_id._set_random_id()
@@ -36,6 +53,8 @@ class DashDependency:  # pylint: disable=too-few-public-methods
 
         self.component_property = component_property
         self.allow_duplicate = False
+        self.allow_optional = False
+        self.partial_pattern = False
 
     def __str__(self):
         return f"{self.component_id_str()}.{self.component_property}"
@@ -43,23 +62,19 @@ class DashDependency:  # pylint: disable=too-few-public-methods
     def __repr__(self):
         return f"<{self.__class__.__name__} `{self}`>"
 
-    def component_id_str(self):
-        i = self.component_id
+    def component_id_str(self) -> str:
+        return stringify_id(self.component_id)
 
-        def _dump(v):
-            return json.dumps(v, sort_keys=True, separators=(",", ":"))
-
-        def _json(k, v):
-            vstr = v.to_json() if hasattr(v, "to_json") else json.dumps(v)
-            return f"{json.dumps(k)}:{vstr}"
-
-        if isinstance(i, dict):
-            return "{" + ",".join(_json(k, i[k]) for k in sorted(i)) + "}"
-
-        return i
-
-    def to_dict(self):
-        return {"id": self.component_id_str(), "property": self.component_property}
+    def to_dict(self) -> dict:
+        specs: Any = {
+            "id": self.component_id_str(),
+            "property": self.component_property,
+        }
+        if self.allow_optional:
+            specs["allow_optional"] = True
+        if self.partial_pattern:
+            specs["partial"] = True
+        return specs
 
     def __eq__(self, other):
         """
@@ -73,48 +88,54 @@ class DashDependency:  # pylint: disable=too-few-public-methods
             and self._id_matches(other)
         )
 
-    def _id_matches(self, other):
+    def _id_matches(self, other) -> bool:
         my_id = self.component_id
         other_id = other.component_id
+
         self_dict = isinstance(my_id, dict)
         other_dict = isinstance(other_id, dict)
 
         if self_dict != other_dict:
             return False
-        if self_dict:
-            if set(my_id.keys()) != set(other_id.keys()):
+        if not self_dict:
+            return my_id == other_id
+
+        my_keys = set(my_id.keys())  # type: ignore
+        other_keys = set(other_id.keys())  # type: ignore
+        partial = self.partial_pattern or getattr(other, "partial_pattern", False)
+
+        keys_ok = (
+            (my_keys <= other_keys or other_keys <= my_keys)
+            if partial
+            else my_keys == other_keys
+        )
+        if not keys_ok:
+            return False
+        common_keys = my_keys & other_keys if partial else my_keys
+
+        for k in common_keys:
+            v = my_id[k]  # type: ignore
+            other_v = other_id[k]  # type: ignore
+            if v == other_v:
+                continue
+            v_wild = isinstance(v, Wildcard)
+            other_wild = isinstance(other_v, Wildcard)
+            if not (v_wild or other_wild):
                 return False
-
-            for k, v in my_id.items():
-                other_v = other_id[k]
-                if v == other_v:
-                    continue
-                v_wild = isinstance(v, _Wildcard)
-                other_wild = isinstance(other_v, _Wildcard)
-                if v_wild or other_wild:
-                    if not (v_wild and other_wild):
-                        continue  # one wild, one not
-                    if v is ALL or other_v is ALL:
-                        continue  # either ALL
-                    if v is MATCH or other_v is MATCH:
-                        return False  # one MATCH, one ALLSMALLER
-                else:
-                    return False
-            return True
-
-        # both strings
-        return my_id == other_id
+            if v_wild and other_wild and not (v is ALL or other_v is ALL):
+                return False
+        return True
 
     def __hash__(self):
         return hash(str(self))
 
-    def has_wildcard(self):
+    def has_wildcard(self) -> bool:
         """
         Return true if id contains a wildcard (MATCH, ALL, or ALLSMALLER)
         """
         if isinstance(self.component_id, dict):
             for v in self.component_id.values():
-                if isinstance(v, _Wildcard):
+                if isinstance(v, Wildcard):
                     return True
         return False
 
@@ -124,13 +145,31 @@ class Output(DashDependency):  # pylint: disable=too-few-public-methods
 
     allowed_wildcards = (MATCH, ALL)
 
-    def __init__(self, component_id, component_property, allow_duplicate=False):
+    def __init__(
+        self,
+        component_id: ComponentIdType,
+        component_property: str,
+        allow_duplicate: bool = False,
+        partial_pattern: bool = False,
+    ):
         super().__init__(component_id, component_property)
         self.allow_duplicate = allow_duplicate
+        self.partial_pattern = partial_pattern
 
 
 class Input(DashDependency):  # pylint: disable=too-few-public-methods
     """Input of callback: trigger an update when it is updated."""
+
+    def __init__(
+        self,
+        component_id: ComponentIdType,
+        component_property: str,
+        allow_optional: bool = False,
+        partial_pattern: bool = False,
+    ):
+        super().__init__(component_id, component_property)
+        self.allow_optional = allow_optional
+        self.partial_pattern = partial_pattern
 
     allowed_wildcards = (MATCH, ALL, ALLSMALLER)
 
@@ -138,11 +177,22 @@ class Input(DashDependency):  # pylint: disable=too-few-public-methods
 class State(DashDependency):  # pylint: disable=too-few-public-methods
     """Use the value of a State in a callback but don't trigger updates."""
 
+    def __init__(
+        self,
+        component_id: ComponentIdType,
+        component_property: str,
+        allow_optional: bool = False,
+        partial_pattern: bool = False,
+    ):
+        super().__init__(component_id, component_property)
+        self.allow_optional = allow_optional
+        self.partial_pattern = partial_pattern
+
     allowed_wildcards = (MATCH, ALL, ALLSMALLER)
 
 
 class ClientsideFunction:  # pylint: disable=too-few-public-methods
-    def __init__(self, namespace=None, function_name=None):
+    def __init__(self, namespace: str, function_name: str):
 
         if namespace.startswith("_dashprivate_"):
             raise ValueError("Namespaces cannot start with '_dashprivate_'.")

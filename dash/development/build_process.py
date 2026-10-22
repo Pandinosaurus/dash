@@ -8,7 +8,7 @@ import coloredlogs
 import fire
 import requests
 
-from .._utils import run_command_with_process, compute_md5, job
+from .._utils import run_command_with_process, compute_hash, job
 
 logger = logging.getLogger(__name__)
 coloredlogs.install(
@@ -97,7 +97,7 @@ class BuildProcess:
             logger.info("bundles in %s %s", folder, copies)
 
             for copy in copies:
-                payload[f"MD5 ({copy})"] = compute_md5(self._concat(folder, copy))
+                payload[f"SHA256 ({copy})"] = compute_hash(self._concat(folder, copy))
 
         with open(self._concat(self.main, "digest.json"), "w", encoding="utf-8") as fp:
             json.dump(payload, fp, sort_keys=True, indent=4, separators=(",", ":"))
@@ -143,8 +143,23 @@ class BuildProcess:
                 versions[f"extra_{name_squashed}_versions"] = f'"{extras_str}"'
 
                 for extra_version in extras:
-                    url = f"https://unpkg.com/{name}@{extra_version}/umd/{filename}"
+                    # React 19+ removed UMD builds, use umd-react package instead
+                    if name in ("react", "react-dom") and extra_version.startswith(
+                        "19."
+                    ):
+                        # Map filename to umd-react dist path
+                        if "production.min" in filename:
+                            umd_filename = f"{name}.production.min.js"
+                        elif "development" in filename:
+                            umd_filename = f"{name}.development.js"
+                        else:
+                            umd_filename = filename
+                        url = f"https://unpkg.com/umd-react@{extra_version}/dist/{umd_filename}"
+                    else:
+                        url = f"https://unpkg.com/{name}@{extra_version}/umd/{filename}"
+
                     res = requests.get(url)
+                    res.raise_for_status()
                     extra_target = f"{name}@{extra_version}.{ext}"
                     extra_path = self._concat(self.deps_folder, extra_target)
                     with open(extra_path, "wb") as fp:
@@ -167,7 +182,10 @@ class BuildProcess:
 class Renderer(BuildProcess):
     def __init__(self):
         """dash-renderer's path is binding with the dash folder hierarchy."""
-        extras = ["18.2.0"]  # versions to include beyond what's in package.json
+        extras = [
+            "18.2.0",
+            "19.2.4",
+        ]  # versions to include beyond what's in package.json
         super().__init__(
             self._concat(os.path.dirname(__file__), os.pardir, "dash-renderer"),
             (

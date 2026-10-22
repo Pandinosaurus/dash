@@ -10,6 +10,10 @@ class ObsoleteKwargException(DashException):
     pass
 
 
+class ObsoleteAttributeException(DashException):
+    pass
+
+
 class NoLayoutException(DashException):
     pass
 
@@ -87,7 +91,7 @@ class DuplicateCallback(DashException):
     pass
 
 
-class LongCallbackError(DashException):
+class BackgroundCallbackError(DashException):
     pass
 
 
@@ -96,4 +100,28 @@ class MissingLongCallbackManagerError(DashException):
 
 
 class PageError(DashException):
+    pass
+
+
+class ImportedInsideCallbackError(DashException):
+    pass
+
+
+class HookError(DashException):
+    pass
+
+
+class AppNotFoundError(DashException):
+    pass
+
+
+class WebSocketCallbackError(CallbackException):
+    pass
+
+
+class WebsocketDisconnected(CallbackException):
+    pass
+
+
+class StreamCallbackError(CallbackException):
     pass

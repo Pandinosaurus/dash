@@ -1,45 +1,60 @@
+import asyncio
 import functools
 import os
 import sys
 import collections
+import inspect
 import importlib
 import warnings
-from contextvars import copy_context
 from importlib.machinery import ModuleSpec
+from importlib.util import find_spec
+from importlib import metadata
 import pkgutil
 import threading
+from contextvars import ContextVar
 import re
 import logging
-import time
 import mimetypes
 import hashlib
 import base64
-import traceback
 from urllib.parse import urlparse
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Optional,
+    Type,
+    Union,
+    Sequence,
+    Literal,
+    List,
+)
 
-import flask
-
-from pkg_resources import get_distribution, parse_version
+import traceback
 
 from dash import dcc
 from dash import html
 from dash import dash_table
-
-from .fingerprint import build_fingerprint, check_fingerprint
+from .fingerprint import build_fingerprint
 from .resources import Scripts, Css
 from .dependencies import (
-    Output,
     Input,
+    Output,
+    State,
 )
 from .development.base_component import ComponentRegistry
 from .exceptions import (
-    PreventUpdate,
-    InvalidResourceError,
     ProxyError,
     DuplicateCallback,
 )
+from .backends import get_backend
 from .version import __version__
-from ._configs import get_combined_config, pathname_configs, pages_folder_config
+from ._configs import (
+    get_combined_config,
+    load_dash_env_vars,
+    pathname_configs,
+    pages_folder_config,
+)
 from ._utils import (
     AttributeDict,
     format_tag,
@@ -52,15 +67,26 @@ from ._utils import (
     to_json,
     convert_to_AttributeDict,
     gen_salt,
+    hooks_to_js_object,
+    get_caller_name,
+    get_root_path,
+    alias_main_module,
 )
 from . import _callback
+from . import _callback_signing
 from . import _get_paths
 from . import _dash_renderer
 from . import _validate
 from . import _watch
 from . import _get_app
+from . import backends
 
+from ._get_app import with_app_context, with_app_context_factory
+from ._shared_storage import BaseSharedStorage, SharedStorageError
+from ._shared_storage._env import storage_from_env
 from ._grouping import map_grouping, grouping_len, update_args_group
+from ._obsolete import ObsoleteChecker
+from ._callback_context import callback_context
 
 from . import _pages
 from ._pages import (
@@ -70,6 +96,18 @@ from ._pages import (
     _import_layouts_from_pages,
 )
 from ._jupyter import jupyter_dash, JupyterDisplayMode
+from .types import CallbackExecutionBody, RendererHooks
+
+RouteCallable = Callable[..., Any]
+
+# If dash_design_kit is installed, check for version
+ddk_version = None
+if find_spec("dash_design_kit"):
+    ddk_version = metadata.version("dash_design_kit")
+
+plotly_version = None
+if find_spec("plotly"):
+    plotly_version = metadata.version("plotly")
 
 # Add explicit mapping for map files
 mimetypes.add_type("application/json", ".map", True)
@@ -118,14 +156,21 @@ _ID_LOCATION = "_pages_location"
 _ID_STORE = "_pages_store"
 _ID_DUMMY = "_pages_dummy"
 
+_UNINITIALIZED = object()  # Sentinel for tracking init_app state
+# Default for ``shared_storage`` so "not passed" (DASH_SHARED_STORAGE may pick
+# the backend) can be told apart from an explicit argument.
+_SHARED_STORAGE_DEFAULT: Any = object()
+
+DASH_VERSION_URL = "https://dash-version.plotly.com:8080/current_version"
+
 # Handles the case in a newly cloned environment where the components are not yet generated.
 try:
-    page_container = html.Div(
+    page_container = html.Div(  # type: ignore[operator]
         [
-            dcc.Location(id=_ID_LOCATION, refresh="callback-nav"),
-            html.Div(id=_ID_CONTENT, disable_n_clicks=True),
-            dcc.Store(id=_ID_STORE),
-            html.Div(id=_ID_DUMMY, disable_n_clicks=True),
+            dcc.Location(id=_ID_LOCATION, refresh="callback-nav"),  # type: ignore[operator]
+            html.Div(id=_ID_CONTENT, disable_n_clicks=True),  # type: ignore[operator]
+            dcc.Store(id=_ID_STORE),  # type: ignore[operator]
+            html.Div(id=_ID_DUMMY, disable_n_clicks=True),  # type: ignore[operator]
         ]
     )
 # pylint: disable-next=bare-except
@@ -134,48 +179,77 @@ except:  # noqa: E722
 
 
 def _get_traceback(secret, error: Exception):
-
     try:
         # pylint: disable=import-outside-toplevel
         from werkzeug.debug import tbtools
     except ImportError:
-        tbtools = None
+        tbtools = None  # type: ignore[assignment]
 
-    def _get_skip(text, divider=2):
-        skip = 0
-        for i, line in enumerate(text):
-            if "%% callback invoked %%" in line:
-                skip = int((i + 1) / divider)
-                break
+    def _get_skip(error):
+        from dash._callback import (  # pylint: disable=import-outside-toplevel
+            _invoke_callback,
+            _async_invoke_callback,
+        )
+
+        tb = error.__traceback__
+        skip = 1
+        while tb.tb_next is not None:
+            skip += 1
+            tb = tb.tb_next
+            if tb.tb_frame.f_code in [
+                _invoke_callback.__code__,
+                _async_invoke_callback.__code__,
+            ]:
+                return skip
+
         return skip
+
+    def _do_skip(error):
+        from dash._callback import (  # pylint: disable=import-outside-toplevel
+            _invoke_callback,
+            _async_invoke_callback,
+        )
+
+        tb = error.__traceback__
+        while tb.tb_next is not None:
+            if tb.tb_frame.f_code in [
+                _invoke_callback.__code__,
+                _async_invoke_callback.__code__,
+            ]:
+                return tb.tb_next
+            tb = tb.tb_next
+        return error.__traceback__
 
     # werkzeug<2.1.0
     if hasattr(tbtools, "get_current_traceback"):
-        tb = tbtools.get_current_traceback()
-        skip = _get_skip(tb.plaintext.splitlines())
-        return tbtools.get_current_traceback(skip=skip).render_full()
+        return tbtools.get_current_traceback(  # type: ignore
+            skip=_get_skip(error)
+        ).render_full()
 
     if hasattr(tbtools, "DebugTraceback"):
-        tb = tbtools.DebugTraceback(error)  # pylint: disable=no-member
-        skip = _get_skip(tb.render_traceback_text().splitlines())
-
         # pylint: disable=no-member
-        return tbtools.DebugTraceback(error, skip=skip).render_debugger_html(
-            True, secret, True
-        )
+        return tbtools.DebugTraceback(  # type: ignore
+            error, skip=_get_skip(error)
+        ).render_debugger_html(True, secret, True)
 
-    tb = traceback.format_exception(type(error), error, error.__traceback__)
-    skip = _get_skip(tb, 1)
-    return tb[0] + "".join(tb[skip:])
+    return "".join(traceback.format_exception(type(error), error, _do_skip(error)))
 
 
 # Singleton signal to not update an output, alternative to PreventUpdate
 no_update = _callback.NoUpdate()  # pylint: disable=protected-access
 
 
+async def execute_async_function(func, *args, **kwargs):
+    # Check if the function is a coroutine function
+    if inspect.iscoroutinefunction(func):
+        return await func(*args, **kwargs)
+    # If the function is not a coroutine, call it directly
+    return func(*args, **kwargs)
+
+
 # pylint: disable=too-many-instance-attributes
 # pylint: disable=too-many-arguments, too-many-locals
-class Dash:
+class Dash(ObsoleteChecker):
     """Dash is a framework for building analytical web applications.
     No JavaScript required.
 
@@ -189,12 +263,17 @@ class Dash:
         best value to use. Default ``'__main__'``, env: ``DASH_APP_NAME``
     :type name: string
 
-    :param server: Sets the Flask server for your app. There are three options:
-        ``True`` (default): Dash will create a new server
+    :param server: Sets the server for your app. There are three options:
+        ``True`` (default): Dash will create a new server using the specified backend
         ``False``: The server will be added later via ``app.init_app(server)``
-            where ``server`` is a ``flask.Flask`` instance.
-        ``flask.Flask``: use this pre-existing Flask server.
-    :type server: boolean or flask.Flask
+        A server instance: Use a pre-existing server (Flask, Quart, or FastAPI)
+    :type server: boolean or server instance
+
+    :param backend: The backend to use for the Dash app. Can be a string
+        (name of the backend) or a backend class. Default is None, which
+        selects the Flask backend. Currently, "flask", "fastapi", and "quart" backends
+        are supported.
+    :type backend: string or type
 
     :param assets_folder: a path, relative to the current working directory,
         for extra files to be used in the browser. Default ``'assets'``.
@@ -212,8 +291,22 @@ class Dash:
         to be True. Default `None`.
     :type use_pages: boolean
 
-    :param include_pages_meta: Include the page meta tags for twitter cards.
+    :param include_pages_meta: Include the meta tags for social media cards.
     :type include_pages_meta: bool
+
+    :param title: Default ``Dash``. Configures the document.title
+        (the text that appears in a browser tab).
+
+    :param update_title: Default ``Updating...``. Configures the document.title
+        (the text that appears in a browser tab) text when a callback is being run.
+        Set to None or '' if you don't want the document.title to change or if you
+        want to control the document.title through a separate component or
+        clientside callback.
+
+    :param description:  Sets a default description for meta tags.
+
+    :param image: The default image used for social media cards. Can be the
+        name of an image in the assets folder or an image URL.
 
     :param assets_url_path: The local urls for assets will be:
         ``requests_pathname_prefix + assets_url_path + '/' + asset_path``
@@ -226,6 +319,12 @@ class Dash:
         served if specifically requested. You cannot use this to prevent access
         to sensitive files.
     :type assets_ignore: string
+
+    :param assets_path_ignore: A list of regex, each regex as a string to pass to ``re.compile``, for
+        assets path to omit from immediate loading. The files in these ignored paths will still be
+        served if specifically requested. You cannot use this to prevent access
+        to sensitive files.
+    :type assets_path_ignore: list of strings
 
     :param assets_external_path: an absolute URL from which to load assets.
         Use with ``serve_locally=False``. assets_external_path is joined
@@ -321,89 +420,204 @@ class Dash:
         be called after the Flask server is attached.
     :type plugins: list of objects
 
-    :param title: Default ``Dash``. Configures the document.title
-    (the text that appears in a browser tab).
-
-    :param update_title: Default ``Updating...``. Configures the document.title
-    (the text that appears in a browser tab) text when a callback is being run.
-    Set to None or '' if you don't want the document.title to change or if you
-    want to control the document.title through a separate component or
-    clientside callback.
-
-    :param long_callback_manager: Deprecated, use ``background_callback_manager``
-        instead.
-
     :param background_callback_manager: Background callback manager instance
         to support the ``@callback(..., background=True)`` decorator.
         One of ``DiskcacheManager`` or ``CeleryManager`` currently supported.
 
     :param add_log_handler: Automatically add a StreamHandler to the app logger
         if not added previously.
+
+    :param hooks: Extend Dash renderer functionality by passing a dictionary of
+    javascript functions. To hook into the layout, use dict keys "layout_pre" and
+    "layout_post". To hook into the callbacks, use keys "request_pre" and "request_post"
+
+    :param routing_callback_inputs: When using Dash pages (use_pages=True), allows to
+    add new States to the routing callback, to pass additional data to the layout
+    functions. The syntax for this parameter is a dict of State objects:
+    `routing_callback_inputs={"language": Input("language", "value")}`
+    NOTE: the keys "pathname_" and "search_" are reserved for internal use.
+
+    :param on_error: Global callback error handler to call when
+        an exception is raised. Receives the exception object as first argument.
+        The callback_context can be used to access the original callback inputs,
+        states and output.
+
+    :param use_async: When True, the app will create async endpoints, as a dev,
+        they will be responsible for installing the `flask[async]` dependency.
+    :type use_async: boolean
+
+    :param health_endpoint: Path for the health check endpoint. Set to None to
+        disable the health endpoint. Default is None.
+    :type health_endpoint: string or None
+
+    :param csrf_token_name: Name of the cookie to read the CSRF token from.
+        Default ``'_csrf_token'``. Set this to match the CSRF cookie name
+        used by your server framework (e.g. ``'csrftoken'`` for Django).
+    :type csrf_token_name: string
+
+    :param csrf_header_name: Name of the HTTP header to send the CSRF token in.
+        Default ``'X-CSRFToken'``.
+    :type csrf_header_name: string
+
+    :param stream_keepalive_interval: How long a streaming callback may
+        go without yielding, in milliseconds, before the response emits a
+        blank keepalive line. Default 15000. Keeps proxy idle timeouts
+        (nginx ``proxy_read_timeout`` defaults to 60s) from closing a stream
+        while the callback is still working. Set to None or 0 to disable.
+    :type stream_keepalive_interval: int or None
+
+    :param stream_poll_interval: On WSGI (Flask), how often the browser polls
+        for streamed frames while it has streams running, in milliseconds.
+        Default 100. It re-polls at this interval while frames are arriving
+        and backs off to five times it while quiet, so frame latency stays
+        within a few hundred milliseconds. A WSGI worker thread is held for the life of a
+        response, so instead of one open connection per browser (which pins a
+        thread each and exhausts a pool at a few dozen browsers) each poll
+        takes a thread for milliseconds. ASGI backends (Quart, FastAPI) keep
+        one open connection per browser instead and ignore this.
+    :type stream_poll_interval: int
+
+    :param shared_storage: Backend for ``dash.ctx.shared_storage`` and the
+        streaming-callback transport: a ``BaseSharedStorage`` subclass or
+        instance, or ``None`` to disable. Default ``LocalSharedStorage`` (one
+        machine or pod). When not passed, the ``DASH_SHARED_STORAGE``
+        environment variable can choose it: ``local``, ``none``,
+        ``diskcache:///absolute/path``, or a ``redis://`` / ``rediss://`` URL.
+        An explicit argument, including ``None``, always wins.
+
+        Stream requests are signed per page load, so with several workers or
+        pods they all need the same signing secret: set ``server.secret_key``
+        or the ``DASH_SECRET_KEY`` environment variable. ``DASH_SECRET_KEY`` is
+        used for Dash's own signing only and does not set ``server.secret_key``.
+    :type shared_storage: BaseSharedStorage subclass or instance, or None
     """
 
-    def __init__(  # pylint: disable=too-many-statements
+    _plotlyjs_url: str
+    STARTUP_ROUTES: list = []
+
+    server: Any
+
+    # Layout is a complex type which can be many things
+    _layout: Any
+    _extra_components: Any
+
+    def __init__(  # pylint: disable=too-many-statements, too-many-branches
         self,
-        name=None,
-        server=True,
-        assets_folder="assets",
-        pages_folder="pages",
-        use_pages=None,
-        assets_url_path="assets",
-        assets_ignore="",
-        assets_external_path=None,
-        eager_loading=False,
-        include_assets_files=True,
-        include_pages_meta=True,
-        url_base_pathname=None,
-        requests_pathname_prefix=None,
-        routes_pathname_prefix=None,
-        serve_locally=True,
-        compress=None,
-        meta_tags=None,
-        index_string=_default_index,
-        external_scripts=None,
-        external_stylesheets=None,
-        suppress_callback_exceptions=None,
-        prevent_initial_callbacks=False,
-        show_undo_redo=False,
-        extra_hot_reload_paths=None,
-        plugins=None,
-        title="Dash",
-        update_title="Updating...",
-        long_callback_manager=None,
-        background_callback_manager=None,
-        add_log_handler=True,
+        name: Optional[str] = None,
+        server: Union[bool, Callable[[], Any]] = True,
+        backend: Union[str, type, None] = None,
+        assets_folder: str = "assets",
+        pages_folder: str = "pages",
+        use_pages: Optional[bool] = None,
+        assets_url_path: str = "assets",
+        assets_ignore: str = "",
+        assets_path_ignore: Optional[List[str]] = None,
+        assets_external_path: Optional[str] = None,
+        eager_loading: bool = False,
+        include_assets_files: bool = True,
+        include_pages_meta: bool = True,
+        title: str = "Dash",
+        update_title: str = "Updating...",
+        description: Optional[str] = None,
+        image: Optional[str] = None,
+        url_base_pathname: Optional[str] = None,
+        requests_pathname_prefix: Optional[str] = None,
+        routes_pathname_prefix: Optional[str] = None,
+        serve_locally: bool = True,
+        compress: Optional[bool] = None,
+        meta_tags: Optional[Sequence[Dict[str, Any]]] = None,
+        index_string: str = _default_index,
+        external_scripts: Optional[Sequence[Union[str, Dict[str, Any]]]] = None,
+        external_stylesheets: Optional[Sequence[Union[str, Dict[str, Any]]]] = None,
+        suppress_callback_exceptions: Optional[bool] = None,
+        prevent_initial_callbacks: bool = False,
+        show_undo_redo: bool = False,
+        extra_hot_reload_paths: Optional[Sequence[str]] = None,
+        plugins: Optional[list] = None,
+        background_callback_manager: Optional[
+            Any
+        ] = None,  # Type should be specified if possible
+        add_log_handler: bool = True,
+        hooks: Optional[RendererHooks] = None,
+        routing_callback_inputs: Optional[Dict[str, Union[Input, State]]] = None,
+        on_error: Optional[Callable[[Exception], Any]] = None,
+        use_async: Optional[bool] = None,
+        health_endpoint: Optional[str] = None,
+        csrf_token_name: str = "_csrf_token",
+        csrf_header_name: str = "X-CSRFToken",
+        websocket_callbacks: Optional[bool] = False,
+        websocket_allowed_origins: Optional[List[str]] = None,
+        websocket_inactivity_timeout: Optional[int] = 300000,
+        websocket_heartbeat_interval: Optional[int] = 30000,
+        websocket_batch_delay: Optional[float] = 0.005,
+        websocket_max_workers: Optional[int] = 4,
+        stream_keepalive_interval: Optional[int] = 15000,
+        stream_poll_interval: int = 100,
+        shared_storage: Optional[
+            Union[Type[BaseSharedStorage], BaseSharedStorage]
+        ] = _SHARED_STORAGE_DEFAULT,
+        enable_mcp: Optional[bool] = None,
+        mcp_path: Optional[str] = None,
         **obsolete,
     ):
+
+        use_async = _validate.check_async(use_async)
         _validate.check_obsolete(obsolete)
 
-        # We have 3 cases: server is either True (we create the server), False
-        # (defer server creation) or a Flask app instance (we use their server)
-        if isinstance(server, flask.Flask):
-            self.server = server
-            if name is None:
-                name = getattr(server, "name", "__main__")
-        elif isinstance(server, bool):
-            name = name if name else "__main__"
-            self.server = flask.Flask(name) if server else None
+        if not csrf_token_name or not csrf_token_name.strip():
+            raise ValueError("csrf_token_name must be a non-empty string")
+        if not csrf_header_name or not csrf_header_name.strip():
+            raise ValueError("csrf_header_name must be a non-empty string")
+
+        module_name = get_caller_name()
+        caller_name: str = name if name is not None else module_name
+
+        # Alias based on the module that is running, not the app name: an
+        # explicit ``name`` or an app factory still runs from the main module.
+        alias_main_module(module_name)
+
+        # Determine backend
+        if backend is None:
+            backend_cls = get_backend("flask")
+        elif isinstance(backend, str):
+            backend_cls = get_backend(backend)
+        elif isinstance(backend, type):
+            backend_cls = backend
         else:
-            raise ValueError("server must be a Flask app or a boolean")
+            raise ValueError("Invalid backend argument")
+
+        # Determine server and backend instance
+        if server not in (None, True, False):
+            # User provided a server instance (e.g., Flask, Quart, FastAPI)
+            inferred_backend = backends.get_server_type(server)
+            _validate.check_backend(backend, inferred_backend)
+            backend_cls = get_backend(inferred_backend)
+            if name is None:
+                caller_name = getattr(server, "name", caller_name)
+
+            self.backend = backend_cls(server)
+            self.server = server
+        else:
+            # No server instance provided, create backend and let backend create server
+            self.server = backend_cls.create_app(caller_name)  # type: ignore
+            self.backend = backend_cls(self.server)
 
         base_prefix, routes_prefix, requests_prefix = pathname_configs(
             url_base_pathname, routes_pathname_prefix, requests_pathname_prefix
         )
 
         self.config = AttributeDict(
-            name=name,
+            name=caller_name,
             assets_folder=os.path.join(
-                flask.helpers.get_root_path(name), assets_folder
-            ),
+                get_root_path(caller_name), assets_folder
+            ),  # type: ignore
             assets_url_path=assets_url_path,
             assets_ignore=assets_ignore,
+            assets_path_ignore=assets_path_ignore,
             assets_external_path=get_combined_config(
                 "assets_external_path", assets_external_path, ""
             ),
-            pages_folder=pages_folder_config(name, pages_folder, use_pages),
+            pages_folder=pages_folder_config(caller_name, pages_folder, use_pages),
             eager_loading=eager_loading,
             include_assets_files=get_combined_config(
                 "include_assets_files", include_assets_files, True
@@ -425,6 +639,12 @@ class Dash:
             title=title,
             update_title=update_title,
             include_pages_meta=include_pages_meta,
+            description=description,
+            image=image,
+            health_endpoint=health_endpoint,
+            hide_all_callbacks=False,
+            csrf_token_name=csrf_token_name,
+            csrf_header_name=csrf_header_name,
         )
         self.config.set_read_only(
             [
@@ -435,6 +655,8 @@ class Dash:
                 "serve_locally",
                 "compress",
                 "pages_folder",
+                "csrf_token_name",
+                "csrf_header_name",
             ],
             "Read-only: can only be set in the Dash constructor",
         )
@@ -448,39 +670,60 @@ class Dash:
 
         self.pages_folder = str(pages_folder)
         self.use_pages = (pages_folder != "pages") if use_pages is None else use_pages
+        self.routing_callback_inputs = routing_callback_inputs or {}
 
         # keep title as a class property for backwards compatibility
         self.title = title
+        self.description = description
+        self.image = image
+
+        # MCP (Model Context Protocol) configuration
+        self._enable_mcp = get_combined_config("mcp_enabled", enable_mcp, False)
+        _mcp_path = get_combined_config("mcp_path", mcp_path, "_mcp")
+        self._mcp_path = (
+            _mcp_path.lstrip("/") if isinstance(_mcp_path, str) else _mcp_path
+        )
 
         # list of dependencies - this one is used by the back end for dispatching
-        self.callback_map = {}
+        self.callback_map: dict = {}
         # same deps as a list to catch duplicate outputs, and to send to the front end
-        self._callback_list = []
+        self._callback_list: list = []
+        self.callback_api_paths: dict = {}
+        self.mcp_decorated_functions: dict = {}
+        # The collection serving the current MCP request, picked from
+        # _mcp_callback_maps by the configured cache_by key.
+        self._mcp_callback_map: ContextVar = ContextVar(
+            "mcp_callback_map", default=None
+        )
+        self._mcp_callback_maps: collections.OrderedDict = collections.OrderedDict()
+        self._mcp_callback_maps_lock = threading.Lock()
 
         # list of inline scripts
-        self._inline_scripts = []
+        self._inline_scripts: list = []
 
         # index_string has special setter so can't go in config
-        self._index_string = ""
+        self._index_string: str = ""
         self.index_string = index_string
         self._favicon = None
 
         # default renderer string
-        self.renderer = "var renderer = new DashRenderer();"
+        self.renderer = f"var renderer = new DashRenderer({hooks_to_js_object(hooks)});"
 
         # static files from the packages
         self.css = Css(serve_locally)
         self.scripts = Scripts(serve_locally, eager_loading)
 
-        self.registered_paths = collections.defaultdict(set)
+        self.registered_paths: Any = collections.defaultdict(set)
 
         # urls
-        self.routes = []
+        self.routes: Any = []
 
         self._layout = None
         self._layout_is_function = False
         self.validation_layout = None
+        self._on_error = on_error
         self._extra_components = []
+        self._use_async = use_async
 
         self._setup_dev_tools()
         self._hot_reload = AttributeDict(
@@ -491,23 +734,60 @@ class Dash:
             changed_assets=[],
         )
 
-        self._assets_files = []
-        self._long_callback_count = 0
-        self._background_manager = background_callback_manager or long_callback_manager
+        self._assets_files: list = []
+
+        self._background_manager = background_callback_manager
+        self._websocket_callbacks = websocket_callbacks
+        self._websocket_allowed_origins = websocket_allowed_origins or []
+        self._websocket_inactivity_timeout = websocket_inactivity_timeout
+        self._websocket_heartbeat_interval = websocket_heartbeat_interval
+        self._websocket_batch_delay = websocket_batch_delay
+        self._websocket_max_workers = websocket_max_workers
+        self._stream_keepalive_interval = stream_keepalive_interval
+        self._stream_poll_interval = stream_poll_interval
+
+        # Shared storage (state manager + pub/sub). Started lazily on first
+        # access so it costs nothing until used and never binds in a gunicorn
+        # preload master or the Flask reloader parent -- only in the worker that
+        # actually touches it.
+        if shared_storage is _SHARED_STORAGE_DEFAULT:
+            shared_storage = storage_from_env(
+                load_dash_env_vars().get("DASH_SHARED_STORAGE")
+            )
+        self._shared_storage_arg = shared_storage
+        self._shared_storage_instance: Optional[BaseSharedStorage] = None
+        self._shared_storage_lock = threading.Lock()
 
         self.logger = logging.getLogger(__name__)
 
         if not self.logger.handlers and add_log_handler:
             self.logger.addHandler(logging.StreamHandler(stream=sys.stdout))
 
-        if isinstance(plugins, patch_collections_abc("Iterable")):
+        if plugins is not None and isinstance(
+            plugins, patch_collections_abc("Iterable")
+        ):
             for plugin in plugins:
                 plugin.plug(self)
 
+        self._setup_hooks()
+
         # tracks internally if a function already handled at least one request.
         self._got_first_request = {"pages": False, "setup_server": False}
+        # Serialize the before_request hooks so a raced-in worker cannot see
+        # the guard flag while the work behind it is still in flight (gh-3971).
+        # The async lock is created inside router_async so it binds to the
+        # running event loop; on 3.9 asyncio.Lock captures the loop at
+        # construction, which for a Dash instance built in module scope is
+        # the wrong one.
+        self._setup_server_lock = threading.Lock()
+        self._pages_lock = threading.Lock()
+        self._pages_async_lock: Optional[asyncio.Lock] = None
 
-        if self.server is not None:
+        # Fallback signing secret, used when neither server.secret_key nor
+        # DASH_SECRET_KEY is set. See _get_signing_secret.
+        self._generated_signing_secret: Optional[bytes] = None
+
+        if server:
             self.init_app()
 
         self.logger.setLevel(logging.INFO)
@@ -515,14 +795,54 @@ class Dash:
         if self.__class__.__name__ == "JupyterDash":
             warnings.warn(
                 "JupyterDash is deprecated, use Dash instead.\n"
-                "See https://dash.plotly.com/dash-in-jupyter for more details."
+                "See https://dash.plotly.com/dash-in-jupyter for more details.",
+                stacklevel=2,
+            )
+        self.setup_startup_routes()
+
+        self._plotly_cloud = None
+
+    def _setup_hooks(self):
+        # pylint: disable=import-outside-toplevel,protected-access
+        from ._hooks import HooksManager
+
+        self._hooks = HooksManager
+        self._hooks.register_setuptools()
+
+        for setup in self._hooks.get_hooks("setup"):
+            setup(self)
+
+        for hook in self._hooks.get_hooks("callback"):
+            callback_args, callback_kwargs = hook.data  # type: ignore
+            self.callback(*callback_args, **callback_kwargs)(hook.func)
+
+        for (
+            clientside_function,
+            args,
+            kwargs,
+        ) in self._hooks.hooks._clientside_callbacks:
+            _callback.register_clientside_callback(
+                self._callback_list,
+                self.callback_map,
+                self.config.prevent_initial_callbacks,
+                self._inline_scripts,
+                clientside_function,
+                *args,
+                **kwargs,
             )
 
-    def init_app(self, app=None, **kwargs):
-        """Initialize the parts of Dash that require a flask app."""
+        if self._hooks.get_hooks("error"):
+            self._on_error = self._hooks.HookErrorHandler(self._on_error)
 
+    def init_app(self, app: Optional[Any] = None, **kwargs) -> None:
         config = self.config
-
+        config.unset_read_only(
+            [
+                "url_base_pathname",
+                "routes_pathname_prefix",
+                "requests_pathname_prefix",
+            ]
+        )
         config.update(kwargs)
         config.set_read_only(
             [
@@ -532,108 +852,173 @@ class Dash:
             ],
             "Read-only: can only be set in the Dash constructor or during init_app()",
         )
-
         if app is not None:
             self.server = app
+            # Also update the backend's server reference so routes are registered
+            # on the correct server (important when using server=False pattern)
+            self.backend.server = app
+
+        # Skip registration if already initialized on this server
+        # This prevents double registration when init_app() is called multiple times
+        # (e.g., with flask run pattern where __init__ calls init_app, then user does too)
+        if getattr(self, "_initialized_server", _UNINITIALIZED) is self.server:
+            return
+        self._initialized_server = self.server
 
         bp_prefix = config.routes_pathname_prefix.replace("/", "_").replace(".", "_")
         assets_blueprint_name = f"{bp_prefix}dash_assets"
-
-        self.server.register_blueprint(
-            flask.Blueprint(
-                assets_blueprint_name,
-                config.name,
-                static_folder=self.config.assets_folder,
-                static_url_path=config.routes_pathname_prefix
-                + self.config.assets_url_path.lstrip("/"),
-            )
+        self.backend.register_assets_blueprint(
+            assets_blueprint_name,
+            config.routes_pathname_prefix + self.config.assets_url_path.lstrip("/"),
+            self.config.assets_folder,
         )
-
         if config.compress:
-            try:
-                # pylint: disable=import-outside-toplevel
-                from flask_compress import Compress
+            self.backend.enable_compression()  # type: ignore
 
-                # gzip
-                Compress(self.server)
-
-                _flask_compress_version = parse_version(
-                    get_distribution("flask-compress").version
-                )
-
-                if not hasattr(
-                    self.server.config, "COMPRESS_ALGORITHM"
-                ) and _flask_compress_version >= parse_version("1.6.0"):
-                    # flask-compress==1.6.0 changed default to ['br', 'gzip']
-                    # and non-overridable default compression with Brotli is
-                    # causing performance issues
-                    self.server.config["COMPRESS_ALGORITHM"] = ["gzip"]
-            except ImportError as error:
-                raise ImportError(
-                    "To use the compress option, you need to install dash[compress]"
-                ) from error
-
-        @self.server.errorhandler(PreventUpdate)
         def _handle_error(_):
             """Handle a halted callback and return an empty 204 response."""
             return "", 204
 
-        self.server.before_request(self._setup_server)
-
+        # To-Do add error handlers for these two scenarios
+        # add handler for halted callbacks
+        # self.backend.before_request(_handle_error)
         # add a handler for components suites errors to return 404
-        self.server.errorhandler(InvalidResourceError)(self._invalid_resources_handler)
+        # self.server.errorhandler(InvalidResourceError)(self._invalid_resources_handler)
 
+        self.backend.register_error_handlers()
+        self.backend.before_request(self._setup_server)
+        self.backend.setup_backend(self)
         self._setup_routes()
-
         _get_app.APP = self
         self.enable_pages()
+        self._setup_plotlyjs()
 
-    def _add_url(self, name, view_func, methods=("GET",)):
+    def _add_url(self, name: str, view_func: RouteCallable, methods=("GET",)) -> None:
         full_name = self.config.routes_pathname_prefix + name
-
-        self.server.add_url_rule(
-            full_name, view_func=view_func, endpoint=full_name, methods=list(methods)
+        self.backend.add_url_rule(
+            full_name,
+            view_func=view_func,
+            endpoint=full_name,
+            methods=list(methods),
         )
-
-        # record the url in Dash.routes so that it can be accessed later
-        # e.g. for adding authentication with flask_login
         self.routes.append(full_name)
 
-    def _setup_routes(self):
-        self._add_url(
-            "_dash-component-suites/<string:package_name>/<path:fingerprinted_path>",
-            self.serve_component_suites,
+    def _serve_default_favicon(self):
+        return self.backend.make_response(
+            pkgutil.get_data("dash", "favicon.ico"), content_type="image/x-icon"
         )
+
+    def _setup_routes(self):
+        self.backend.setup_component_suites(self)
         self._add_url("_dash-layout", self.serve_layout)
         self._add_url("_dash-dependencies", self.dependencies)
-        self._add_url("_dash-update-component", self.dispatch, ["POST"])
+        self._add_url(
+            "_dash-update-component",
+            self.backend.serve_callback(self),
+            ["POST"],
+        )
         self._add_url("_reload-hash", self.serve_reload_hash)
-        self._add_url("_favicon.ico", self._serve_default_favicon)
-        self._add_url("", self.index)
+        self._add_url(
+            "_favicon.ico",
+            self._serve_default_favicon,  # pylint: disable=protected-access
+        )
+        if self.config.health_endpoint is not None:
+            self._add_url(self.config.health_endpoint, self.serve_health)
+
+        # Set up WebSocket callback route if backend supports it
+        # This enables both global websocket_callbacks and per-callback websocket=True
+        if self.backend.websocket_capability:
+            self.backend.serve_websocket_callback(self)
+
+        self.backend.setup_index(self)
+        self.backend.setup_catchall(self)
 
         if jupyter_dash.active:
             self._add_url(
                 "_alive_" + jupyter_dash.alive_token, jupyter_dash.serve_alive
             )
 
-        # catch-all for front-end routes, used by dcc.Location
-        self._add_url("<path:path>", self.index)
+        for hook in self._hooks.get_hooks("routes"):
+            self._add_url(
+                hook.data["name"],
+                with_app_context_factory(hook.func, self),
+                hook.data["methods"],
+            )
+
+        if self._enable_mcp:
+            from .mcp import (  # pylint: disable=import-outside-toplevel
+                enable_mcp_server,
+            )
+
+            try:
+                enable_mcp_server(self, self._mcp_path)
+            except Exception as e:  # pylint: disable=broad-exception-caught
+                self._enable_mcp = False
+                self.logger.warning(
+                    "MCP server could not be started at '%s': %s",
+                    self._mcp_path,
+                    e,
+                )
+
+    def setup_apis(self):
+        """
+        Register API endpoints for all callbacks defined using `dash.callback`.
+
+        This method must be called after all callbacks are registered and before the app is served.
+        It ensures that all callback API routes are available for the Dash app to function correctly.
+
+        Typical usage:
+            app = Dash(__name__)
+            # Register callbacks here
+            app.setup_apis()
+            app.run()
+
+        If not called, callback endpoints will not be available and the app will not function as expected.
+        """
+        for k in list(_callback.GLOBAL_API_PATHS):
+            if k in self.callback_api_paths:
+                raise DuplicateCallback(
+                    f"The callback `{k}` provided with `dash.callback` was already "
+                    "assigned with `app.callback`."
+                )
+            self.callback_api_paths[k] = _callback.GLOBAL_API_PATHS.pop(k)
+
+        # Delegate to the server factory for route registration
+        self.backend.register_callback_api_routes(self.callback_api_paths)
+
+    def _setup_plotlyjs(self):
+        # pylint: disable=import-outside-toplevel
+        from plotly.offline import get_plotlyjs_version  # type: ignore[import-untyped]
+
+        url = f"https://cdn.plot.ly/plotly-{get_plotlyjs_version()}.min.js"
+
+        # pylint: disable=protected-access
+        dcc._js_dist.extend(
+            [
+                {
+                    "relative_package_path": "package_data/plotly.min.js",
+                    "external_url": url,
+                    "namespace": "plotly",
+                    "async": "eager",
+                }
+            ]
+        )
+        self._plotlyjs_url = url
 
     @property
-    def layout(self):
+    def mcp_callback_map(self) -> Any:
+        return self._mcp_callback_map.get()
+
+    @mcp_callback_map.setter
+    def mcp_callback_map(self, value: Any):
+        self._mcp_callback_map.set(value)
+
+    @property
+    def layout(self) -> Any:
         return self._layout
 
-    def _layout_value(self):
-        layout = self._layout() if self._layout_is_function else self._layout
-
-        # Add any extra components
-        if self._extra_components:
-            layout = html.Div(children=[layout] + self._extra_components)
-
-        return layout
-
     @layout.setter
-    def layout(self, value):
+    def layout(self, value: Any):
         _validate.validate_layout_type(value)
         self._layout_is_function = callable(value)
         self._layout = value
@@ -645,51 +1030,153 @@ class Dash:
             and not self.validation_layout
             and not self.config.suppress_callback_exceptions
         ):
-
-            def simple_clone(c, children=None):
-                cls = type(c)
-                # in Py3 we can use the __init__ signature to reduce to just
-                # required args and id; in Py2 this doesn't work so we just
-                # empty out children.
-                sig = getattr(cls.__init__, "__signature__", None)
-                props = {
-                    p: getattr(c, p)
-                    for p in c._prop_names  # pylint: disable=protected-access
-                    if hasattr(c, p)
-                    and (
-                        p == "id" or not sig or sig.parameters[p].default == c.REQUIRED
-                    )
-                }
-                if props.get("children", children):
-                    props["children"] = children or []
-                return cls(**props)
-
             layout_value = self._layout_value()
             _validate.validate_layout(value, layout_value)
-            self.validation_layout = simple_clone(
-                # pylint: disable=protected-access
-                layout_value,
-                [simple_clone(c) for c in layout_value._traverse_ids()],
-            )
+            self.validation_layout = layout_value
 
     @property
-    def index_string(self):
+    def shared_storage_enabled(self) -> bool:
+        """Whether this app has a shared-storage backend (not ``None``).
+
+        Cheap to read and does not start the backend, unlike ``shared_storage``.
+        """
+        return self._shared_storage_arg is not None
+
+    @property
+    def shared_storage(self) -> BaseSharedStorage:
+        """The app's shared storage (state manager + pub/sub), backend-agnostic.
+
+        Started on first access in the worker that uses it. Access it from a
+        callback via ``dash.ctx.shared_storage``. Raises if the app was created
+        with ``shared_storage=None``.
+        """
+        if self._shared_storage_arg is None:
+            raise SharedStorageError(
+                "Shared storage is disabled for this app; construct it with "
+                "Dash(shared_storage=...) to use dash.ctx.shared_storage."
+            )
+        if self._shared_storage_instance is None:
+            with self._shared_storage_lock:
+                if self._shared_storage_instance is None:
+                    storage = self._shared_storage_arg
+                    if isinstance(storage, (type, functools.partial)):
+                        storage = storage()
+                    storage.start()
+                    self._shared_storage_instance = storage
+        return self._shared_storage_instance
+
+    def _layout_value(self):
+        if self._layout_is_function:
+            layout = self._layout()  # type: ignore[reportOptionalCall]
+        else:
+            layout = self._layout
+
+        # Add any extra components
+        if self._extra_components:
+            layout = html.Div(children=[layout] + self._extra_components)  # type: ignore[reportArgumentType]
+
+        return layout
+
+    @property
+    def index_string(self) -> str:
         return self._index_string
 
     @index_string.setter
-    def index_string(self, value):
+    def index_string(self, value: str) -> None:
         checks = (_re_index_entry, _re_index_config, _re_index_scripts)
         _validate.validate_index("index string", checks, value)
         self._index_string = value
 
-    def serve_layout(self):
-        layout = self._layout_value()
+    @with_app_context
+    def get_layout(self):
+        """Return the resolved layout with all hooks applied.
 
+        This is the canonical way to obtain the app's layout — it
+        calls the layout function (if callable), includes extra
+        components, and runs layout hooks.
+        """
+        layout = self._layout_value()
+        for hook in self._hooks.get_hooks("layout"):
+            layout = hook(layout)
+        return layout
+
+    def serve_layout(self):
         # TODO - Set browser cache limit - pass hash into frontend
-        return flask.Response(
-            to_json(layout),
+        return self.backend.make_response(
+            to_json(self.get_layout()),
             mimetype="application/json",
         )
+
+    def _get_signing_secret(self) -> bytes:
+        """Return the secret used to sign page tokens (``end_id``), background
+        callback handles and stream connections.
+
+        Resolution order:
+
+        1. The server's ``secret_key`` if set (shared across workers when the
+           operator configures one, e.g. for Flask-Login).
+        2. ``DASH_SECRET_KEY`` from the environment, so a hosting platform can
+           give every worker and pod the same key without editing the app. Used
+           for Dash's own signing only, never assigned to ``server.secret_key``
+           (that would change Flask session behavior).
+        3. Otherwise a random secret persisted in the background-callback result
+           store, so every worker reads back the same value. This is exactly as
+           shared as the callback results themselves, so it works cross-worker
+           whenever the deployment is set up for multi-worker background
+           callbacks (an explicitly shared cache / broker).
+        4. Finally, if no background manager is available, a per-process random
+           secret. Stream tokens then only verify on the worker that issued
+           them, so multi-worker streaming apps need 1 or 2.
+        """
+        key = getattr(self.server, "secret_key", None) or load_dash_env_vars().get(
+            "DASH_SECRET_KEY"
+        )
+        if key:
+            return key.encode("utf-8") if isinstance(key, str) else key
+        if self._generated_signing_secret is None:
+            self._generated_signing_secret = self._resolve_fallback_signing_secret()
+        return self._generated_signing_secret
+
+    def _background_managers(self):
+        """The background-callback managers this app uses, deterministically
+        ordered and de-duplicated by identity."""
+        managers = []
+        seen = set()
+        for candidate in [self._background_manager] + [
+            cb.get("manager") for cb in self.callback_map.values()
+        ]:
+            if candidate is not None and id(candidate) not in seen:
+                seen.add(id(candidate))
+                managers.append(candidate)
+        return managers
+
+    def _resolve_fallback_signing_secret(self) -> bytes:
+        def _generate() -> bytes:
+            return gen_salt(64).encode("utf-8")
+
+        def _coerce(value) -> bytes:
+            if isinstance(value, bytes):
+                return value
+            if isinstance(value, str):
+                return value.encode("utf-8")
+            return bytes(value)
+
+        # Persist the secret in the (shared) result store this app's manager
+        # uses so all workers read back the same value. Every worker runs the
+        # same code, so they resolve the same manager and the same store.
+        for manager in self._background_managers():
+            try:
+                secret = manager.get_or_create_signing_secret(_generate)
+            except NotImplementedError:
+                continue
+            except Exception:  # pylint: disable=broad-except
+                # A misbehaving/unreachable store must not break app startup;
+                # try the next manager, then fall back to a per-process secret.
+                continue
+            if secret:
+                return _coerce(secret)
+
+        return _generate()
 
     def _config(self):
         # pieces of config needed by the front end
@@ -698,11 +1185,48 @@ class Dash:
             "requests_pathname_prefix": self.config.requests_pathname_prefix,
             "ui": self._dev_tools.ui,
             "props_check": self._dev_tools.props_check,
+            "disable_version_check": self._dev_tools.disable_version_check,
             "show_undo_redo": self.config.show_undo_redo,
             "suppress_callback_exceptions": self.config.suppress_callback_exceptions,
             "update_title": self.config.update_title,
             "children_props": ComponentRegistry.children_props,
+            "serve_locally": self.config.serve_locally,
+            "dash_version": __version__,
+            "python_version": sys.version,
+            "dash_version_url": DASH_VERSION_URL,
+            "ddk_version": ddk_version,
+            "plotly_version": plotly_version,
+            "validate_callbacks": self._dev_tools.validate_callbacks,
+            "csrf_token_name": self.config.csrf_token_name,
+            "csrf_header_name": self.config.csrf_header_name,
         }
+
+        # Server-issued, server-signed token for this page load. The renderer
+        # echoes it on every callback request; the server binds background
+        # callback handles (cacheKey/job) to it so they cannot be forged or
+        # replayed from another page load. See dash/_callback_signing.py.
+        end_id = gen_salt(24)
+        config["end_id"] = _callback_signing.sign(
+            self._get_signing_secret(),
+            _callback_signing.END_SCOPE,
+            end_id,
+        )
+        if self._plotly_cloud is None:
+            if os.getenv("DASH_ENTERPRISE_ENV") == "WORKSPACE":
+                # Disable the placeholder button on workspace.
+                self._plotly_cloud = True
+            else:
+                try:
+                    # pylint: disable=C0415,W0611
+                    import plotly_cloud  # type: ignore  # noqa: F401
+
+                    self._plotly_cloud = True
+                except ImportError:
+                    self._plotly_cloud = False
+
+        config["plotly_cloud_installed"] = self._plotly_cloud
+        if not self.config.serve_locally:
+            config["plotlyjs_url"] = self._plotlyjs_url
         if self._dev_tools.hot_reload:
             config["hot_reload"] = {
                 # convert from seconds to msec as used by js `setInterval`
@@ -720,6 +1244,45 @@ class Dash:
 
             config["validation_layout"] = validation_layout
 
+        if self._dev_tools.ui:
+            # Add custom dev tools hooks if the ui is activated.
+            custom_dev_tools = []
+            for hook_dev_tools in self._hooks.get_hooks("dev_tools"):
+                props = hook_dev_tools.get("props", {})
+                if callable(props):
+                    props = props()
+                custom_dev_tools.append({**hook_dev_tools, "props": props})
+            config["dev_tools"] = custom_dev_tools
+
+        # Add websocket config if backend supports it
+        # This enables both global websocket_callbacks and per-callback websocket=True
+        if self.backend.websocket_capability:
+            config["websocket"] = {
+                "enabled": bool(self._websocket_callbacks),
+                "url": self.config.requests_pathname_prefix + "_dash-ws-callback",
+                "worker_url": self._get_worker_url(),
+                "inactivity_timeout": self._websocket_inactivity_timeout,
+                "heartbeat_interval": self._websocket_heartbeat_interval,
+            }
+
+        # Streaming callbacks use the single multiplexed downlink only when a
+        # shared-storage backend is available to broker frames across workers;
+        # otherwise the client streams each callback on its own connection.
+        # The worker script hosts that downlink in a SharedWorker so every tab
+        # of the browser shares one connection (browsers cap connections per
+        # host); the renderer falls back to a per-tab downlink without it.
+        # "mode" is how the downlink is served: one open connection (ASGI) or
+        # polling (WSGI, where an open response would pin a worker thread).
+        config["stream"] = {"enabled": self.shared_storage_enabled}
+        if self.shared_storage_enabled:
+            config["stream"].update(
+                worker_url=self._get_worker_url(
+                    "dash-renderer/build/dash-stream-worker.js"
+                ),
+                mode=self.backend.downlink_mode,
+                poll_interval=self._stream_poll_interval,
+            )
+
         return config
 
     def serve_reload_hash(self):
@@ -731,7 +1294,7 @@ class Dash:
             _reload.hard = False
             _reload.changed_assets = []
 
-        return flask.jsonify(
+        return self.backend.jsonify(
             {
                 "reloadHash": _hash,
                 "hard": hard,
@@ -740,7 +1303,54 @@ class Dash:
             }
         )
 
-    def _collect_and_register_resources(self, resources):
+    def serve_health(self):
+        """
+        Health check endpoint for monitoring Dash server status.
+        Returns a simple "OK" response with HTTP 200 status.
+        """
+        return self.backend.make_response("OK", status=200, mimetype="text/plain")
+
+    def _get_worker_url(
+        self, relative_path: str = "dash-renderer/build/dash-ws-worker.js"
+    ) -> str:
+        """Get the URL for a renderer worker script (WebSocket or streaming).
+
+        Returns:
+            The fingerprinted URL for the worker script served via component suites.
+        """
+        namespace = "dash"
+
+        # Register the path so it can be served
+        self.registered_paths[namespace].add(relative_path)
+
+        # Build fingerprinted URL (same pattern as _collect_and_register_resources)
+        module_path = os.path.join(
+            os.path.dirname(sys.modules[namespace].__file__),  # type: ignore
+            *relative_path.split("/"),
+        )
+
+        # Use a fallback if the file doesn't exist yet (during development)
+        try:
+            modified = int(os.stat(module_path).st_mtime)
+        except FileNotFoundError:
+            modified = 0
+
+        fingerprint = build_fingerprint(relative_path, __version__, modified)
+        return f"{self.config.requests_pathname_prefix}_dash-component-suites/{namespace}/{fingerprint}"
+
+    def get_dist(self, libraries: Sequence[str]) -> list:
+        dists = []
+        for dist_type in ("_js_dist", "_css_dist"):
+            resources = ComponentRegistry.get_resources(dist_type, libraries)
+            srcs = self._collect_and_register_resources(resources, False)
+            for src in srcs:
+                dists.append(dict(type=dist_type, url=src))
+        return dists
+
+    # pylint: disable=too-many-branches
+    def _collect_and_register_resources(
+        self, resources, include_async=True, url_attr="src"
+    ):
         # now needs the app context.
         # template in the necessary component suite JS bundles
         # add the version number of the package as a query parameter
@@ -757,8 +1367,11 @@ class Dash:
             else:
                 version = importlib.import_module(namespace).__version__
 
-            module_path = os.path.join(
-                os.path.dirname(sys.modules[namespace].__file__), relative_package_path
+            # Split on "/" so the file path uses the OS separator: Windows
+            # extended-length paths (\\?\ prefix) reject forward slashes.
+            module_path = os.path.join(  # type: ignore[reportCallIssue]
+                os.path.dirname(sys.modules[namespace].__file__),  # type: ignore[reportCallIssue]
+                *relative_package_path.split("/"),
             )
 
             modified = int(os.stat(module_path).st_mtime)
@@ -769,6 +1382,8 @@ class Dash:
         srcs = []
         for resource in resources:
             is_dynamic_resource = resource.get("dynamic", False)
+            is_async = resource.get("async") is not None
+            excluded = not include_async and is_async
 
             if "relative_package_path" in resource:
                 paths = resource["relative_package_path"]
@@ -780,42 +1395,69 @@ class Dash:
 
                     self.registered_paths[resource["namespace"]].add(rel_path)
 
-                    if not is_dynamic_resource:
-                        srcs.append(
-                            _relative_url_path(
-                                relative_package_path=rel_path,
-                                namespace=resource["namespace"],
-                            )
+                    if not is_dynamic_resource and not excluded:
+                        url = _relative_url_path(
+                            relative_package_path=rel_path,
+                            namespace=resource["namespace"],
                         )
+                        if "attributes" in resource:
+                            srcs.append({url_attr: url, **resource["attributes"]})
+                        else:
+                            srcs.append(url)
             elif "external_url" in resource:
-                if not is_dynamic_resource:
-                    if isinstance(resource["external_url"], str):
-                        srcs.append(resource["external_url"])
-                    else:
-                        srcs += resource["external_url"]
+                if not is_dynamic_resource and not excluded:
+                    urls = (
+                        [resource["external_url"]]
+                        if isinstance(resource["external_url"], str)
+                        else resource["external_url"]
+                    )
+                    for url in urls:
+                        if "attributes" in resource:
+                            srcs.append({url_attr: url, **resource["attributes"]})
+                        else:
+                            srcs.append(url)
             elif "absolute_path" in resource:
                 raise Exception("Serving files from absolute_path isn't supported yet")
             elif "asset_path" in resource:
                 static_url = self.get_asset_url(resource["asset_path"])
-                # Add a cache-busting query param
-                static_url += f"?m={resource['ts']}"
-                srcs.append(static_url)
+                url_with_cache = static_url + f"?m={resource['ts']}"
+                # Import .mjs files with type=module script tag
+                if static_url.endswith(".mjs"):
+                    attrs = {url_attr: url_with_cache, "type": "module"}
+                    if "attributes" in resource:
+                        attrs.update(resource["attributes"])
+                    srcs.append(attrs)
+                else:
+                    if "attributes" in resource:
+                        srcs.append(
+                            {url_attr: url_with_cache, **resource["attributes"]}
+                        )
+                    else:
+                        srcs.append(url_with_cache)
+
         return srcs
 
+    # pylint: disable=protected-access
     def _generate_css_dist_html(self):
         external_links = self.config.external_stylesheets
-        links = self._collect_and_register_resources(self.css.get_all_css())
+        links = self._collect_and_register_resources(
+            self.css.get_all_css()
+            + self.css._resources._filter_resources(self._hooks.hooks._css_dist),
+            url_attr="href",
+        )
 
         return "\n".join(
             [
-                format_tag("link", link, opened=True)
-                if isinstance(link, dict)
-                else f'<link rel="stylesheet" href="{link}">'
+                (
+                    format_tag("link", link, opened=True)
+                    if isinstance(link, dict)
+                    else f'<link rel="stylesheet" href="{link}">'
+                )
                 for link in (external_links + links)
             ]
         )
 
-    def _generate_scripts_html(self):
+    def _generate_scripts_html(self) -> str:
         # Dash renderer has dependencies like React which need to be rendered
         # before every other script. However, the dash renderer bundle
         # itself needs to be rendered after all of the component's
@@ -836,7 +1478,7 @@ class Dash:
         dev = self._dev_tools.serve_dev_bundles
         srcs = (
             self._collect_and_register_resources(
-                self.scripts._resources._filter_resources(deps, dev_bundles=dev)
+                self.scripts._resources._filter_resources(deps, dev_bundles=dev)  # type: ignore[reportArgumentType]
             )
             + self.config.external_scripts
             + self._collect_and_register_resources(
@@ -851,7 +1493,10 @@ class Dash:
                     html._js_dist, dev_bundles=dev
                 )
                 + self.scripts._resources._filter_resources(
-                    dash_table._js_dist, dev_bundles=dev
+                    dash_table._js_dist, dev_bundles=dev  # type: ignore
+                )
+                + self.scripts._resources._filter_resources(
+                    self._hooks.hooks._js_dist, dev_bundles=dev
                 )
             )
         )
@@ -861,18 +1506,20 @@ class Dash:
 
         return "\n".join(
             [
-                format_tag("script", src)
-                if isinstance(src, dict)
-                else f'<script src="{src}"></script>'
+                (
+                    format_tag("script", src)
+                    if isinstance(src, dict)
+                    else f'<script src="{src}"></script>'
+                )
                 for src in srcs
             ]
             + [f"<script>{src}</script>" for src in self._inline_scripts]
         )
 
-    def _generate_config_html(self):
+    def _generate_config_html(self) -> str:
         return f'<script id="_dash-config" type="application/json">{to_json(self._config())}</script>'
 
-    def _generate_renderer(self):
+    def _generate_renderer(self) -> str:
         return f'<script id="_dash-renderer" type="application/javascript">{self.renderer}</script>'
 
     def _generate_meta(self):
@@ -894,61 +1541,23 @@ class Dash:
 
         return meta_tags + self.config.meta_tags
 
-    # Serve the JS bundles for each package
-    def serve_component_suites(self, package_name, fingerprinted_path):
-        path_in_pkg, has_fingerprint = check_fingerprint(fingerprinted_path)
-
-        _validate.validate_js_path(self.registered_paths, package_name, path_in_pkg)
-
-        extension = "." + path_in_pkg.split(".")[-1]
-        mimetype = mimetypes.types_map.get(extension, "application/octet-stream")
-
-        package = sys.modules[package_name]
-        self.logger.debug(
-            "serving -- package: %s[%s] resource: %s => location: %s",
-            package_name,
-            package.__version__,
-            path_in_pkg,
-            package.__path__,
-        )
-
-        response = flask.Response(
-            pkgutil.get_data(package_name, path_in_pkg), mimetype=mimetype
-        )
-
-        if has_fingerprint:
-            # Fingerprinted resources are good forever (1 year)
-            # No need for ETag as the fingerprint changes with each build
-            response.cache_control.max_age = 31536000  # 1 year
-        else:
-            # Non-fingerprinted resources are given an ETag that
-            # will be used / check on future requests
-            response.add_etag()
-            tag = response.get_etag()[0]
-
-            request_etag = flask.request.headers.get("If-None-Match")
-
-            if f'"{tag}"' == request_etag:
-                response = flask.Response(None, status=304)
-
-        return response
-
-    def index(self, *args, **kwargs):  # pylint: disable=unused-argument
+    def index(self, *_args, **_kwargs):
         scripts = self._generate_scripts_html()
         css = self._generate_css_dist_html()
         config = self._generate_config_html()
         metas = self._generate_meta()
         renderer = self._generate_renderer()
-
-        # use self.title instead of app.config.title for backwards compatibility
         title = self.title
+        # Refactored: direct access to global request adapter
+        request = self.backend.request_adapter()
 
-        if self.use_pages and self.config.include_pages_meta:
-            metas = _page_meta_tags(self) + metas
+        # include social media meta tags
+        if self.config.include_pages_meta and request:
+            metas = _page_meta_tags(self, request) + metas
 
         if self._favicon:
             favicon_mod_time = os.path.getmtime(
-                os.path.join(self.config.assets_folder, self._favicon)
+                os.path.join(self.config.assets_folder, *self._favicon.split("/"))
             )
             favicon_url = f"{self.get_asset_url(self._favicon)}?m={favicon_mod_time}"
         else:
@@ -975,6 +1584,9 @@ class Dash:
             favicon=favicon,
             renderer=renderer,
         )
+
+        for hook in self._hooks.get_hooks("index"):
+            index = hook(index)
 
         checks = (
             _re_index_entry_id,
@@ -1043,8 +1655,12 @@ class Dash:
             app_entry=app_entry,
         )
 
+    @with_app_context
     def dependencies(self):
-        return flask.jsonify(self._callback_list)
+        return self.backend.make_response(
+            to_json(self._callback_list),
+            content_type="application/json",
+        )
 
     def clientside_callback(self, clientside_function, *args, **kwargs):
         """Create a callback that updates the output by calling a clientside
@@ -1121,7 +1737,7 @@ class Dash:
             **kwargs,
         )
 
-    def callback(self, *_args, **_kwargs):
+    def callback(self, *_args, **_kwargs) -> Callable[..., Any]:
         """
         Normally used as a decorator, `@app.callback` provides a server-side
         callback relating the values of one or more `Output` items to one or
@@ -1140,209 +1756,217 @@ class Dash:
             config_prevent_initial_callbacks=self.config.prevent_initial_callbacks,
             callback_list=self._callback_list,
             callback_map=self.callback_map,
+            callback_api_paths=self.callback_api_paths,
             **_kwargs,
         )
 
-    def long_callback(
-        self,
-        *_args,
-        manager=None,
-        interval=1000,
-        running=None,
-        cancel=None,
-        progress=None,
-        progress_default=None,
-        cache_args_to_ignore=None,
-        **_kwargs,
-    ):
-        """
-        Deprecated: long callbacks are now supported natively with regular callbacks,
-        use `background=True` with `dash.callback` or `app.callback` instead.
-        """
-        return _callback.callback(
-            *_args,
-            background=True,
-            manager=manager,
-            interval=interval,
-            progress=progress,
-            progress_default=progress_default,
-            running=running,
-            cancel=cancel,
-            cache_args_to_ignore=cache_args_to_ignore,
-            callback_map=self.callback_map,
-            callback_list=self._callback_list,
-            config_prevent_initial_callbacks=self.config.prevent_initial_callbacks,
-            **_kwargs,
-        )
+    def _inputs_to_vals(self, inputs):
+        return inputs_to_vals(inputs)
 
-    def dispatch(self):
-        body = flask.request.get_json()
-
+    # pylint: disable=R0915
+    def _initialize_context(self, body: CallbackExecutionBody):
+        """Initialize the global context for the request."""
+        adapter = self.backend.request_adapter()
         g = AttributeDict({})
-
-        g.inputs_list = inputs = body.get(  # pylint: disable=assigning-non-slot
-            "inputs", []
-        )
-        g.states_list = state = body.get(  # pylint: disable=assigning-non-slot
-            "state", []
-        )
-        output = body["output"]
-        outputs_list = body.get("outputs") or split_callback_id(output)
-        g.outputs_list = outputs_list  # pylint: disable=assigning-non-slot
-
-        g.input_values = (  # pylint: disable=assigning-non-slot
-            input_values
-        ) = inputs_to_dict(inputs)
-        g.state_values = inputs_to_dict(state)  # pylint: disable=assigning-non-slot
-        changed_props = body.get("changedPropIds", [])
-        g.triggered_inputs = [  # pylint: disable=assigning-non-slot
-            {"prop_id": x, "value": input_values.get(x)} for x in changed_props
+        g.inputs_list = body.get("inputs", [])
+        g.states_list = body.get("state", [])
+        g.outputs_list = body.get("outputs", [])
+        g.input_values = inputs_to_dict(g.inputs_list)
+        g.state_values = inputs_to_dict(g.states_list)
+        g.triggered_inputs = [
+            {"prop_id": x, "value": g.input_values.get(x)}
+            for x in body.get("changedPropIds", [])
         ]
+        g.dash_response = self.backend.response_adapter()
+        g.cookies = dict(adapter.cookies)
+        g.headers = dict(adapter.headers)
+        g.args = adapter.args
+        g.path = adapter.full_path
+        g.remote = adapter.remote_addr
+        g.origin = adapter.origin
+        g.updated_props = {}
+        return g
 
-        response = (
-            g.dash_response  # pylint: disable=assigning-non-slot
-        ) = flask.Response(mimetype="application/json")
-
-        args = inputs_to_vals(inputs + state)
-
+    def _prepare_callback(self, g, body: CallbackExecutionBody):
+        """Prepare callback-related data."""
+        output = body["output"]
         try:
             cb = self.callback_map[output]
             func = cb["callback"]
             g.background_callback_manager = (
                 cb.get("manager") or self._background_manager
             )
-            g.ignore_register_page = cb.get("long", False)
+            g.ignore_register_page = cb.get("background", False)
 
             # Add args_grouping
             inputs_state_indices = cb["inputs_state_indices"]
-            inputs_state = inputs + state
-            inputs_state = convert_to_AttributeDict(inputs_state)
+            inputs_state = convert_to_AttributeDict(g.inputs_list + g.states_list)
 
-            # update args_grouping attributes
+            if cb.get("no_output"):
+                g.outputs_list = []
+            elif not g.outputs_list:
+                # Legacy support for older renderers
+                split_callback_id(output)
+
+            # Update args_grouping attributes
             for s in inputs_state:
                 # check for pattern matching: list of inputs or state
                 if isinstance(s, list):
                     for pattern_match_g in s:
-                        update_args_group(pattern_match_g, changed_props)
-                update_args_group(s, changed_props)
+                        update_args_group(
+                            pattern_match_g, body.get("changedPropIds", [])
+                        )
+                update_args_group(s, body.get("changedPropIds", []))
 
-            args_grouping = map_grouping(
-                lambda ind: inputs_state[ind], inputs_state_indices
+            g.args_grouping, g.using_args_grouping = self._prepare_grouping(
+                inputs_state, inputs_state_indices
             )
-
-            g.args_grouping = args_grouping  # pylint: disable=assigning-non-slot
-            g.using_args_grouping = (  # pylint: disable=assigning-non-slot
-                not isinstance(inputs_state_indices, int)
-                and (
-                    inputs_state_indices
-                    != list(range(grouping_len(inputs_state_indices)))
-                )
+            g.outputs_grouping, g.using_outputs_grouping = self._prepare_grouping(
+                g.outputs_list, cb.get("outputs_indices", [])
             )
+        except KeyError as e:
+            raise KeyError(f"Callback function not found for output '{output}'.") from e
+        return func
 
-            # Add outputs_grouping
-            outputs_indices = cb["outputs_indices"]
-            if not isinstance(outputs_list, list):
-                flat_outputs = [outputs_list]
-            else:
-                flat_outputs = outputs_list
+    def _prepare_grouping(self, data_list, indices):
+        """Prepare grouping logic for inputs or outputs."""
+        if not isinstance(data_list, list):
+            flat_data = [data_list]
+        else:
+            flat_data = data_list
 
-            outputs_grouping = map_grouping(
-                lambda ind: flat_outputs[ind], outputs_indices
+        if len(flat_data) > 0:
+            grouping = map_grouping(lambda ind: flat_data[ind], indices)
+            using_grouping = not isinstance(indices, int) and indices != list(
+                range(grouping_len(indices))
             )
-            g.outputs_grouping = outputs_grouping  # pylint: disable=assigning-non-slot
-            g.using_outputs_grouping = (  # pylint: disable=assigning-non-slot
-                not isinstance(outputs_indices, int)
-                and outputs_indices != list(range(grouping_len(outputs_indices)))
-            )
+        else:
+            grouping, using_grouping = [], False
 
-        except KeyError as missing_callback_function:
-            msg = f"Callback function not found for output '{output}', perhaps you forgot to prepend the '@'?"
-            raise KeyError(msg) from missing_callback_function
-        ctx = copy_context()
+        return grouping, using_grouping
+
+    def _execute_callback(self, func, args, outputs_list, g):
+        """Execute the callback with the prepared arguments."""
+        g.custom_data = AttributeDict({})
+
+        for hook in self._hooks.get_hooks("custom_data"):
+            g.custom_data[hook.data["namespace"]] = hook(g)
+
         # noinspection PyArgumentList
-        response.set_data(
-            ctx.run(
-                functools.partial(
-                    func,
-                    *args,
-                    outputs_list=outputs_list,
-                    long_callback_manager=self._background_manager,
-                    callback_context=g,
-                )
-            )
+        partial_func = functools.partial(
+            func,
+            *args,
+            outputs_list=outputs_list,
+            background_callback_manager=g.background_callback_manager,
+            callback_context=g,
+            app=self,
+            app_on_error=self._on_error,
+            app_use_async=self._use_async,
         )
-        return response
+        return partial_func
 
     def _setup_server(self):
         if self._got_first_request["setup_server"]:
             return
-        self._got_first_request["setup_server"] = True
 
-        # Apply _force_eager_loading overrides from modules
-        eager_loading = self.config.eager_loading
-        for module_name in ComponentRegistry.registry:
-            module = sys.modules[module_name]
-            eager = getattr(module, "_force_eager_loading", False)
-            eager_loading = eager_loading or eager
+        # Double-checked locking: previously the guard flag was set before the
+        # work it protects, which let a second thread (e.g. under gunicorn
+        # ``-k gthread``) skip setup while ``registered_paths`` and
+        # ``callback_map`` were still being populated by the first thread and
+        # then fail validation on component bundle requests. See gh-3971.
+        with self._setup_server_lock:
+            if self._got_first_request["setup_server"]:
+                return
 
-        # Update eager_loading settings
-        self.scripts.config.eager_loading = eager_loading
+            # Apply _force_eager_loading overrides from modules
+            eager_loading = self.config.eager_loading
+            for module_name in ComponentRegistry.registry:
+                module = sys.modules[module_name]
+                eager = getattr(module, "_force_eager_loading", False)
+                eager_loading = eager_loading or eager
 
-        if self.config.include_assets_files:
-            self._walk_assets_directory()
+            # Update eager_loading settings
+            self.scripts.config.eager_loading = eager_loading
 
-        if not self.layout and self.use_pages:
-            self.layout = page_container
+            if self.config.include_assets_files:
+                self._walk_assets_directory()
 
-        _validate.validate_layout(self.layout, self._layout_value())
+            if not self.layout and self.use_pages:
+                self.layout = page_container
 
-        self._generate_scripts_html()
-        self._generate_css_dist_html()
+            _validate.validate_layout(self.layout, self._layout_value())
 
-        # Copy over global callback data structures assigned with `dash.callback`
-        for k in list(_callback.GLOBAL_CALLBACK_MAP):
+            self._generate_scripts_html()
+            self._generate_css_dist_html()
 
-            if k in self.callback_map:
-                raise DuplicateCallback(
-                    f"The callback `{k}` provided with `dash.callback` was already "
-                    "assigned with `app.callback`."
+            # Copy over global callback data structures assigned with `dash.callback`
+            for k in list(_callback.GLOBAL_CALLBACK_MAP):
+                if k in self.callback_map:
+                    raise DuplicateCallback(
+                        f"The callback `{k}` provided with `dash.callback` was already "
+                        "assigned with `app.callback`."
+                    )
+
+                self.callback_map[k] = _callback.GLOBAL_CALLBACK_MAP.pop(k)
+
+            self._callback_list.extend(_callback.GLOBAL_CALLBACK_LIST)
+
+            # For each callback function, if the hidden parameter uses the default value None,
+            # replace it with the actual value of the self.config.hide_all_callbacks.
+            self._callback_list = [
+                (
+                    {
+                        **_callback,
+                        "hidden": self.config.get("hide_all_callbacks", False),
+                    }
+                    if _callback.get("hidden") is None
+                    else _callback
                 )
+                for _callback in self._callback_list
+            ]
 
-            self.callback_map[k] = _callback.GLOBAL_CALLBACK_MAP.pop(k)
+            _callback.GLOBAL_CALLBACK_LIST.clear()
 
-        self._callback_list.extend(_callback.GLOBAL_CALLBACK_LIST)
-        _callback.GLOBAL_CALLBACK_LIST.clear()
+            _validate.validate_background_callbacks(self.callback_map)
 
-        _validate.validate_long_callbacks(self.callback_map)
+            cancels = {}
 
-        cancels = {}
+            for callback in self.callback_map.values():
+                background = callback.get("background")
+                if not background:
+                    continue
+                if "cancel_inputs" in background:
+                    cancel = background.pop("cancel_inputs")
+                    for c in cancel:
+                        cancels[c] = background.get("manager")
 
-        for callback in self.callback_map.values():
-            long = callback.get("long")
-            if not long:
-                continue
-            cancel = long.pop("cancel_inputs")
-            if cancel:
-                for c in cancel:
-                    cancels[c] = long.get("manager")
+            if cancels:
+                for cancel_input, manager in cancels.items():
+                    # pylint: disable=cell-var-from-loop
+                    @self.callback(
+                        Output(cancel_input.component_id, "id"),
+                        cancel_input,
+                        prevent_initial_call=True,
+                        manager=manager,
+                    )
+                    def cancel_call(*_):
+                        job_ids = callback_context.args.getlist("cancelJob")
+                        executor = (
+                            _callback.context_value.get().background_callback_manager
+                        )
+                        if job_ids:
+                            secret = self._get_signing_secret()
+                            end_id = _callback.get_request_end_id(secret)
+                            scope = _callback_signing.job_scope(end_id)
+                            for job_id in job_ids:
+                                job = _callback_signing.unsign(secret, scope, job_id)
+                                if job is not None:
+                                    executor.terminate_job(job)
+                        return no_update
 
-        if cancels:
-            for cancel_input, manager in cancels.items():
-
-                # pylint: disable=cell-var-from-loop
-                @self.callback(
-                    Output(cancel_input.component_id, "id"),
-                    cancel_input,
-                    prevent_initial_call=True,
-                    manager=manager,
-                )
-                def cancel_call(*_):
-                    job_ids = flask.request.args.getlist("cancelJob")
-                    executor = _callback.context_value.get().background_callback_manager
-                    if job_ids:
-                        for job_id in job_ids:
-                            executor.terminate_job(job_id)
-                    return no_update
+            # Publish the flag last, so a raced-in thread cannot see it set
+            # while the setup work above is still in flight.
+            self._got_first_request["setup_server"] = True
 
     def _add_assets_resource(self, url_path, file_path):
         res = {"asset_path": url_path, "filepath": file_path}
@@ -1355,11 +1979,18 @@ class Dash:
         walk_dir = self.config.assets_folder
         slash_splitter = re.compile(r"[\\/]+")
         ignore_str = self.config.assets_ignore
+        ignore_path_list = self.config.assets_path_ignore
         ignore_filter = re.compile(ignore_str) if ignore_str else None
+        ignore_path_filters = [
+            re.compile(ignore_path)
+            for ignore_path in (ignore_path_list or [])
+            if ignore_path
+        ]
 
         for current, _, files in sorted(os.walk(walk_dir)):
             if current == walk_dir:
                 base = ""
+                s = ""
             else:
                 s = current.replace(walk_dir, "").lstrip("\\").lstrip("/")
                 splitted = slash_splitter.split(s)
@@ -1368,34 +1999,38 @@ class Dash:
                 else:
                     base = splitted[0]
 
-            if ignore_filter:
-                files_gen = (x for x in files if not ignore_filter.search(x))
+            # Check if any level of current path matches ignore path
+            if s and any(
+                ignore_path_filter.search(x)
+                for ignore_path_filter in ignore_path_filters
+                for x in s.split(os.path.sep)
+            ):
+                pass
             else:
-                files_gen = files
+                if ignore_filter:
+                    files_gen = (x for x in files if not ignore_filter.search(x))
+                else:
+                    files_gen = files
 
-            for f in sorted(files_gen):
-                path = "/".join([base, f]) if base else f
+                for f in sorted(files_gen):
+                    path = "/".join([base, f]) if base else f
 
-                full = os.path.join(current, f)
+                    full = os.path.join(current, f)
 
-                if f.endswith("js"):
-                    self.scripts.append_script(self._add_assets_resource(path, full))
-                elif f.endswith("css"):
-                    self.css.append_css(self._add_assets_resource(path, full))
-                elif f == "favicon.ico":
-                    self._favicon = path
+                    if f.endswith("js"):
+                        self.scripts.append_script(
+                            self._add_assets_resource(path, full)
+                        )
+                    elif f.endswith("css"):
+                        self.css.append_css(self._add_assets_resource(path, full))  # type: ignore[reportArgumentType]
+                    elif f == "favicon.ico":
+                        self._favicon = path
 
     @staticmethod
     def _invalid_resources_handler(err):
         return err.args[0], 404
 
-    @staticmethod
-    def _serve_default_favicon():
-        return flask.Response(
-            pkgutil.get_data("dash", "favicon.ico"), content_type="image/x-icon"
-        )
-
-    def csp_hashes(self, hash_algorithm="sha256"):
+    def csp_hashes(self, hash_algorithm="sha256") -> Sequence[str]:
         """Calculates CSP hashes (sha + base64) of all inline scripts, such that
         one of the biggest benefits of CSP (disallowing general inline scripts)
         can be utilized together with Dash clientside callbacks (inline scripts).
@@ -1434,7 +2069,34 @@ class Dash:
             for script in (self._inline_scripts + [self.renderer])
         ]
 
-    def get_asset_url(self, path):
+    def get_asset_url(self, path: str) -> str:
+        """
+        Return the URL for the provided `path` in the assets directory.
+
+        If `assets_external_path` is set, `get_asset_url` returns
+        `assets_external_path` + `assets_url_path` + `path`, where
+        `path` is the path passed to `get_asset_url`.
+
+        Otherwise, `get_asset_url` returns
+        `requests_pathname_prefix` + `assets_url_path` + `path`, where
+        `path` is the path passed to `get_asset_url`.
+
+        Use `get_asset_url` in an app to access assets at the correct location
+        in different environments. In a deployed app on Dash Enterprise,
+        `requests_pathname_prefix` is the app name. For an app called "my-app",
+        `app.get_asset_url("image.png")` would return:
+
+        ```
+        /my-app/assets/image.png
+        ```
+
+        While the same app running locally, without
+        `requests_pathname_prefix` set, would return:
+
+        ```
+        /assets/image.png
+        ```
+        """
         return _get_paths.app_get_asset_url(self.config, path)
 
     def get_relative_path(self, path):
@@ -1478,7 +2140,7 @@ class Dash:
             self.config.requests_pathname_prefix, path
         )
 
-    def strip_relative_path(self, path):
+    def strip_relative_path(self, path: str) -> Union[str, None]:
         """
         Return a path with `requests_pathname_prefix` and leading and trailing
         slashes stripped from it. Also, if None is passed in, None is returned.
@@ -1529,6 +2191,45 @@ class Dash:
             self.config.requests_pathname_prefix, path
         )
 
+    @staticmethod
+    def add_startup_route(
+        name: str, view_func: RouteCallable, methods: Sequence[Literal["POST", "GET"]]
+    ) -> None:
+        """
+        Add a route to the app to be initialized at the end of Dash initialization.
+        Use this if the package requires a route to be added to the app, and you will not need to worry about at what point to add it.
+
+        :param name: The name of the route. eg "my-new-url/path".
+        :param view_func: The function to call when the route is requested. The function should return a JSON serializable object.
+        :param methods: The HTTP methods that the route should respond to. eg ["GET", "POST"] or either one.
+        """
+        if not isinstance(name, str) or name.startswith("/"):
+            raise ValueError("name must be a string and should not start with '/'")
+
+        if not callable(view_func):
+            raise ValueError("view_func must be callable")
+
+        valid_methods = {"POST", "GET"}
+        if not set(methods).issubset(valid_methods):
+            raise ValueError(f"methods should only contain {valid_methods}")
+
+        if any(route[0] == name for route in Dash.STARTUP_ROUTES):
+            raise ValueError(f"Route name '{name}' is already in use.")
+
+        Dash.STARTUP_ROUTES.append((name, view_func, methods))
+
+    def setup_startup_routes(self) -> None:
+        """
+        Initialize the startup routes stored in STARTUP_ROUTES.
+        """
+        for _name, _view_func, _methods in self.STARTUP_ROUTES:
+            self._add_url(
+                f"_dash_startup_route/{_name}",
+                with_app_context_factory(_view_func, self),
+                _methods,
+            )
+        self.STARTUP_ROUTES = []
+
     def _setup_dev_tools(self, **kwargs):
         debug = kwargs.get("debug", False)
         dev_tools = self._dev_tools = AttributeDict()
@@ -1540,6 +2241,7 @@ class Dash:
             "hot_reload",
             "silence_routes_logging",
             "prune_errors",
+            "validate_callbacks",
         ):
             dev_tools[attr] = get_combined_config(
                 attr, kwargs.get(attr, None), default=debug
@@ -1554,21 +2256,30 @@ class Dash:
                 get_combined_config(attr, kwargs.get(attr, None), default=default)
             )
 
+        dev_tools["disable_version_check"] = get_combined_config(
+            "disable_version_check",
+            kwargs.get("disable_version_check", None),
+            default=False,
+        )
+
         return dev_tools
 
-    def enable_dev_tools(
+    def enable_dev_tools(  # pylint: disable=too-many-branches
         self,
-        debug=None,
-        dev_tools_ui=None,
-        dev_tools_props_check=None,
-        dev_tools_serve_dev_bundles=None,
-        dev_tools_hot_reload=None,
-        dev_tools_hot_reload_interval=None,
-        dev_tools_hot_reload_watch_interval=None,
-        dev_tools_hot_reload_max_retry=None,
-        dev_tools_silence_routes_logging=None,
-        dev_tools_prune_errors=None,
-    ):
+        debug: Optional[bool] = None,
+        dev_tools_ui: Optional[bool] = None,
+        dev_tools_props_check: Optional[bool] = None,
+        dev_tools_serve_dev_bundles: Optional[bool] = None,
+        dev_tools_hot_reload: Optional[bool] = None,
+        dev_tools_hot_reload_interval: Optional[int] = None,
+        dev_tools_hot_reload_watch_interval: Optional[int] = None,
+        dev_tools_hot_reload_max_retry: Optional[int] = None,
+        dev_tools_silence_routes_logging: Optional[bool] = None,
+        dev_tools_disable_version_check: Optional[bool] = None,
+        dev_tools_prune_errors: Optional[bool] = None,
+        dev_tools_validate_callbacks: Optional[bool] = None,
+        first_run: bool = True,
+    ) -> bool:
         """Activate the dev tools, called by `run`. If your application
         is served by wsgi and you want to activate the dev tools, you can call
         this method out of `__main__`.
@@ -1587,7 +2298,9 @@ class Dash:
             - DASH_HOT_RELOAD_WATCH_INTERVAL
             - DASH_HOT_RELOAD_MAX_RETRY
             - DASH_SILENCE_ROUTES_LOGGING
+            - DASH_DISABLE_VERSION_CHECK
             - DASH_PRUNE_ERRORS
+            - DASH_VALIDATE_CALLBACKS
 
         :param debug: Enable/disable all the dev tools unless overridden by the
             arguments or environment variables. Default is ``True`` when
@@ -1626,17 +2339,27 @@ class Dash:
             env: ``DASH_HOT_RELOAD_MAX_RETRY``
         :type dev_tools_hot_reload_max_retry: int
 
-        :param dev_tools_silence_routes_logging: Silence the `werkzeug` logger,
-            will remove all routes logging. Enabled with debugging by default
-            because hot reload hash checks generate a lot of requests.
+        :param dev_tools_silence_routes_logging: Silence the route logging for the
+            web server (werkzeug for Flask, hypercorn for Quart, uvicorn for FastAPI).
+            Enabled with debugging by default because hot reload hash checks generate
+            a lot of requests.
             env: ``DASH_SILENCE_ROUTES_LOGGING``
         :type dev_tools_silence_routes_logging: bool
+
+        :param dev_tools_disable_version_check: Silence the upgrade
+            notification to prevent making requests to the Dash server.
+            env: ``DASH_DISABLE_VERSION_CHECK``
+        :type dev_tools_disable_version_check: bool
 
         :param dev_tools_prune_errors: Reduce tracebacks to just user code,
             stripping out Flask and Dash pieces. Only available with debugging.
             `True` by default, set to `False` to see the complete traceback.
             env: ``DASH_PRUNE_ERRORS``
         :type dev_tools_prune_errors: bool
+
+        :param dev_tools_validate_callbacks: Check for circular callback
+            dependencies and raise an error if any are found. env: ``DASH_VALIDATE_CALLBACKS``
+        :type dev_tools_validate_callbacks: bool
 
         :return: debug
         """
@@ -1653,20 +2376,33 @@ class Dash:
             hot_reload_watch_interval=dev_tools_hot_reload_watch_interval,
             hot_reload_max_retry=dev_tools_hot_reload_max_retry,
             silence_routes_logging=dev_tools_silence_routes_logging,
+            disable_version_check=dev_tools_disable_version_check,
             prune_errors=dev_tools_prune_errors,
+            validate_callbacks=dev_tools_validate_callbacks,
         )
 
         if dev_tools.silence_routes_logging:
-            logging.getLogger("werkzeug").setLevel(logging.ERROR)
+            # Silence route logging based on backend type
+            backend_type = getattr(self.backend, "server_type", "flask")
+            if backend_type == "flask":
+                logging.getLogger("werkzeug").setLevel(logging.ERROR)
+            elif backend_type == "quart":
+                # Quart uses hypercorn as its ASGI server
+                logging.getLogger("hypercorn.access").setLevel(logging.ERROR)
+                logging.getLogger("hypercorn.error").setLevel(logging.ERROR)
+            elif backend_type == "fastapi":
+                # FastAPI uses uvicorn as its ASGI server
+                logging.getLogger("uvicorn.access").setLevel(logging.ERROR)
+                logging.getLogger("uvicorn.error").setLevel(logging.ERROR)
 
         if dev_tools.hot_reload:
             _reload = self._hot_reload
             _reload.hash = generate_hash()
 
-            # find_loader should return None on __main__ but doesn't
+            # find_spec should return None on __main__ but doesn't
             # on some Python versions https://bugs.python.org/issue14710
             packages = [
-                pkgutil.find_loader(x)
+                find_spec(x)
                 for x in list(ComponentRegistry.registry)
                 if x != "__main__"
             ]
@@ -1676,35 +2412,57 @@ class Dash:
 
             if "_pytest" in sys.modules:
                 from _pytest.assertion.rewrite import (  # pylint: disable=import-outside-toplevel
-                    AssertionRewritingHook,
+                    AssertionRewritingHook,  # type: ignore[reportPrivateImportUsage]
                 )
 
                 for index, package in enumerate(packages):
-                    if isinstance(package, AssertionRewritingHook):
-                        dash_spec = importlib.util.find_spec("dash")
-                        dash_test_path = dash_spec.submodule_search_locations[0]
-                        setattr(dash_spec, "path", dash_test_path)
+                    if package and isinstance(package.loader, AssertionRewritingHook):
+                        dash_spec = importlib.util.find_spec("dash")  # type: ignore[reportAttributeAccess]
                         packages[index] = dash_spec
 
-            component_packages_dist = [
-                dash_test_path
-                if isinstance(package, ModuleSpec)
-                else os.path.dirname(package.path)
-                if hasattr(package, "path")
-                else os.path.dirname(
-                    package._path[0]  # pylint: disable=protected-access
-                )
-                if hasattr(package, "_path")
-                else package.filename
-                for package in packages
-            ]
+            component_packages_dist = []
+            for package in packages:
+                if package and isinstance(package, ModuleSpec):
+                    # For ModuleSpec objects, use submodule_search_locations or origin
+                    if package.submodule_search_locations:
+                        component_packages_dist.append(
+                            package.submodule_search_locations[0]
+                        )
+                    elif package.origin:
+                        component_packages_dist.append(os.path.dirname(package.origin))
+                    else:
+                        component_packages_dist.append("")
+                else:
+                    # Fallback for non-ModuleSpec objects (shouldn't happen with find_spec)
+                    if hasattr(package, "path"):
+                        component_packages_dist.append(os.path.dirname(package.path))  # type: ignore
+                    elif hasattr(package, "_path"):
+                        component_packages_dist.append(os.path.dirname(package._path[0]))  # type: ignore # pylint: disable=protected-access
+                    elif hasattr(package, "filename"):
+                        component_packages_dist.append(package.filename)  # type: ignore
+                    else:
+                        component_packages_dist.append("")
 
             for i, package in enumerate(packages):
-                if hasattr(package, "path") and "dash/dash" in os.path.dirname(
-                    package.path
+                if package and isinstance(package, ModuleSpec):
+                    # Check origin for ModuleSpec objects
+                    pkg_dir = (
+                        package.submodule_search_locations[0]
+                        if package.submodule_search_locations
+                        else os.path.dirname(package.origin)
+                        if package.origin
+                        else None
+                    )
+                    if pkg_dir and "dash/dash" in pkg_dir:
+                        component_packages_dist[i : i + 1] = [
+                            os.path.join(pkg_dir, x)
+                            for x in ["dcc", "html", "dash_table"]
+                        ]
+                elif hasattr(package, "path") and "dash/dash" in os.path.dirname(
+                    package.path  # type: ignore[union-attr]
                 ):
                     component_packages_dist[i : i + 1] = [
-                        os.path.join(os.path.dirname(package.path), x)
+                        os.path.join(os.path.dirname(package.path), x)  # type: ignore[union-attr]
                         for x in ["dcc", "html", "dash_table"]
                     ]
 
@@ -1719,55 +2477,15 @@ class Dash:
             _reload.watch_thread.start()
 
         if debug:
-
             if jupyter_dash.active:
                 jupyter_dash.configure_callback_exception_handling(
                     self, dev_tools.prune_errors
                 )
-            elif dev_tools.prune_errors:
-                secret = gen_salt(20)
-
-                @self.server.errorhandler(Exception)
-                def _wrap_errors(error):
-                    # find the callback invocation, if the error is from a callback
-                    # and skip the traceback up to that point
-                    # if the error didn't come from inside a callback, we won't
-                    # skip anything.
-                    tb = _get_traceback(secret, error)
-                    return tb, 500
+            secret = gen_salt(20)
+            self.backend.register_prune_error_handler(secret, dev_tools.prune_errors)
 
         if debug and dev_tools.ui:
-
-            def _before_request():
-                flask.g.timing_information = {  # pylint: disable=assigning-non-slot
-                    "__dash_server": {"dur": time.time(), "desc": None}
-                }
-
-            def _after_request(response):
-                timing_information = flask.g.get("timing_information", None)
-                if timing_information is None:
-                    return response
-
-                dash_total = timing_information.get("__dash_server", None)
-                if dash_total is not None:
-                    dash_total["dur"] = round((time.time() - dash_total["dur"]) * 1000)
-
-                for name, info in timing_information.items():
-
-                    value = name
-                    if info.get("desc") is not None:
-                        value += f';desc="{info["desc"]}"'
-
-                    if info.get("dur") is not None:
-                        value += f";dur={info['dur']}"
-
-                    response.headers.add("Server-Timing", value)
-
-                return response
-
-            self.server.before_request(_before_request)
-
-            self.server.after_request(_after_request)
+            self.backend.register_timing_hooks(first_run)
 
         if (
             debug
@@ -1813,7 +2531,7 @@ class Dash:
                     if filename.endswith("js"):
                         self.scripts.append_script(res)
                     elif filename.endswith("css"):
-                        self.css.append_css(res)
+                        self.css.append_css(res)  # type: ignore[reportArgumentType]
 
                 if deleted:
                     if filename in self._assets_files:
@@ -1835,25 +2553,29 @@ class Dash:
                         # pylint: disable=protected-access
                         delete_resource(self.css._resources._resources)
 
+    # pylint: disable=too-many-branches
     def run(
         self,
-        host=os.getenv("HOST", "127.0.0.1"),
-        port=os.getenv("PORT", "8050"),
-        proxy=os.getenv("DASH_PROXY", None),
-        debug=None,
-        jupyter_mode: JupyterDisplayMode = None,
-        jupyter_width="100%",
-        jupyter_height=650,
-        jupyter_server_url=None,
-        dev_tools_ui=None,
-        dev_tools_props_check=None,
-        dev_tools_serve_dev_bundles=None,
-        dev_tools_hot_reload=None,
-        dev_tools_hot_reload_interval=None,
-        dev_tools_hot_reload_watch_interval=None,
-        dev_tools_hot_reload_max_retry=None,
-        dev_tools_silence_routes_logging=None,
-        dev_tools_prune_errors=None,
+        host: Optional[str] = None,
+        port: Optional[Union[str, int]] = None,
+        proxy: Optional[str] = None,
+        debug: Optional[bool] = None,
+        hide_all_callbacks: bool = False,
+        jupyter_mode: Optional[JupyterDisplayMode] = None,
+        jupyter_width: str = "100%",
+        jupyter_height: int = 650,
+        jupyter_server_url: Optional[str] = None,
+        dev_tools_ui: Optional[bool] = None,
+        dev_tools_props_check: Optional[bool] = None,
+        dev_tools_serve_dev_bundles: Optional[bool] = None,
+        dev_tools_hot_reload: Optional[bool] = None,
+        dev_tools_hot_reload_interval: Optional[int] = None,
+        dev_tools_hot_reload_watch_interval: Optional[int] = None,
+        dev_tools_hot_reload_max_retry: Optional[int] = None,
+        dev_tools_silence_routes_logging: Optional[bool] = None,
+        dev_tools_disable_version_check: Optional[bool] = None,
+        dev_tools_prune_errors: Optional[bool] = None,
+        dev_tools_validate_callbacks: Optional[bool] = None,
         **flask_run_options,
     ):
         """Start the flask server in local mode, you should not run this on a
@@ -1862,11 +2584,11 @@ class Dash:
         If a parameter can be set by an environment variable, that is listed
         too. Values provided here take precedence over environment variables.
 
-        :param host: Host IP used to serve the application
+        :param host: Host IP used to serve the application, default to "127.0.0.1"
             env: ``HOST``
         :type host: string
 
-        :param port: Port used to serve the application
+        :param port: Port used to serve the application, default to "8050"
             env: ``PORT``
         :type port: int
 
@@ -1887,6 +2609,14 @@ class Dash:
             ``enable_dev_tools`` is called directly, and ``False`` when called
             via ``run``. env: ``DASH_DEBUG``
         :type debug: bool
+
+        :param hide_all_callbacks: Default ``False``: Sets the default value of
+            ``hidden`` for all callbacks added to the app. Normally all callbacks
+            are visible in the devtools callbacks tab. You can set this for
+            individual callbacks by setting ``hidden`` in their definitions, or set
+            it ``True`` here in which case you must explicitly set it ``False`` for
+            those callbacks you wish to remain visible in the devtools callbacks tab.
+        :type hide_all_callbacks: bool
 
         :param dev_tools_ui: Show the dev tools UI. env: ``DASH_UI``
         :type dev_tools_ui: bool
@@ -1919,17 +2649,27 @@ class Dash:
             env: ``DASH_HOT_RELOAD_MAX_RETRY``
         :type dev_tools_hot_reload_max_retry: int
 
-        :param dev_tools_silence_routes_logging: Silence the `werkzeug` logger,
-            will remove all routes logging. Enabled with debugging by default
-            because hot reload hash checks generate a lot of requests.
+        :param dev_tools_silence_routes_logging: Silence the route logging for the
+            web server (werkzeug for Flask, hypercorn for Quart, uvicorn for FastAPI).
+            Enabled with debugging by default because hot reload hash checks generate
+            a lot of requests.
             env: ``DASH_SILENCE_ROUTES_LOGGING``
         :type dev_tools_silence_routes_logging: bool
+
+        :param dev_tools_disable_version_check: Silence the upgrade
+            notification to prevent making requests to the Dash server.
+            env: ``DASH_DISABLE_VERSION_CHECK``
+        :type dev_tools_disable_version_check: bool
 
         :param dev_tools_prune_errors: Reduce tracebacks to just user code,
             stripping out Flask and Dash pieces. Only available with debugging.
             `True` by default, set to `False` to see the complete traceback.
             env: ``DASH_PRUNE_ERRORS``
         :type dev_tools_prune_errors: bool
+
+        :param dev_tools_validate_callbacks: Check for circular callback
+            dependencies and raise an error if any are found. env: ``DASH_VALIDATE_CALLBACKS``
+        :type dev_tools_validate_callbacks: bool
 
         :param jupyter_mode: How to display the application when running
             inside a jupyter notebook.
@@ -1949,6 +2689,10 @@ class Dash:
 
         :return:
         """
+
+        # Update self.config.hide_all_callbacks
+        self.config.update({"hide_all_callbacks": hide_all_callbacks})
+
         if debug is None:
             debug = get_combined_config("debug", None, False)
 
@@ -1962,15 +2706,30 @@ class Dash:
             dev_tools_hot_reload_watch_interval,
             dev_tools_hot_reload_max_retry,
             dev_tools_silence_routes_logging,
+            dev_tools_disable_version_check,
             dev_tools_prune_errors,
+            dev_tools_validate_callbacks,
         )
+
+        # Evaluate the env variables at runtime
+
+        if "CONDA_PREFIX" in os.environ:
+            # Some conda systems has issue with setting the host environment
+            # to an invalid hostname.
+            # Related issue: https://github.com/plotly/dash/issues/3069
+            host = host or "127.0.0.1"
+        else:
+            host = host or os.getenv("HOST", "127.0.0.1")
+        assert host
+        port = port or os.getenv("PORT", "8050")
+        proxy = proxy or os.getenv("DASH_PROXY")
 
         # Verify port value
         try:
-            port = int(port)
+            port = int(port)  # type: ignore
             assert port in range(1, 65536)
         except Exception as e:
-            e.args = [f"Expecting an integer from 1 to 65535, found port={repr(port)}"]
+            e.args = (f"Expecting an integer from 1 to 65535, found port={repr(port)}",)
             raise
 
         # so we only see the "Running on" message once with hot reloading
@@ -2009,6 +2768,13 @@ class Dash:
 
             if not jupyter_dash or not jupyter_dash.in_ipython:
                 self.logger.info("Dash is running on %s://%s%s%s\n", *display_url)
+                if self._enable_mcp:
+                    self.logger.info(
+                        " * MCP available at %s://%s%s%s%s\n",
+                        *display_url[:3],
+                        self.config.routes_pathname_prefix,
+                        self._mcp_path,
+                    )
 
         if self.config.extra_hot_reload_paths:
             extra_files = flask_run_options["extra_files"] = []
@@ -2021,6 +2787,14 @@ class Dash:
                     extra_files.append(path)
 
         if jupyter_dash.active:
+            if jupyter_server_url is None and proxy:
+                # The app is served on host:port but reached through the proxy,
+                # so the notebook must display the proxied url.
+                proxied_url = urlparse(proxy.split("::")[1])
+                jupyter_server_url = (
+                    f"{proxied_url.scheme}://{proxied_url.hostname}"
+                    + (f":{proxied_url.port}" if proxied_url.port else "")
+                )
             jupyter_dash.run_app(
                 self,
                 mode=jupyter_mode,
@@ -2031,96 +2805,204 @@ class Dash:
                 server_url=jupyter_server_url,
             )
         else:
-            self.server.run(host=host, port=port, debug=debug, **flask_run_options)
+            self.backend.run(
+                dash_app=self, host=host, port=port, debug=debug, **flask_run_options
+            )
 
-    def enable_pages(self):
+    def enable_pages(self) -> None:
         if not self.use_pages:
             return
         if self.pages_folder:
             _import_layouts_from_pages(self.config.pages_folder)
 
-        @self.server.before_request
-        def router():
+        # Async version
+        async def router_async():
             if self._got_first_request["pages"]:
                 return
-            self._got_first_request["pages"] = True
 
-            @self.callback(
-                Output(_ID_CONTENT, "children"),
-                Output(_ID_STORE, "data"),
-                Input(_ID_LOCATION, "pathname"),
-                Input(_ID_LOCATION, "search"),
-                prevent_initial_call=True,
-            )
-            def update(pathname, search):
-                """
-                Updates dash.page_container layout on page navigation.
-                Updates the stored page title which will trigger the clientside callback to update the app title
-                """
+            # Lazily create the lock so it binds to the running event loop
+            # (see __init__). Check-and-assign is safe here: asyncio only
+            # yields at await points, so no other task can race between the
+            # two lines.
+            if self._pages_async_lock is None:
+                self._pages_async_lock = asyncio.Lock()
 
-                query_parameters = _parse_query_string(search)
-                page, path_variables = _path_to_page(self.strip_relative_path(pathname))
+            # Double-checked locking, same rationale as _setup_server
+            # (gh-3971). Without it a raced-in task can either serve requests
+            # against an unregistered _ID_CONTENT callback or hit
+            # DuplicateCallback registering the router callback twice.
+            async with self._pages_async_lock:
+                if self._got_first_request["pages"]:
+                    return
 
-                # get layout
-                if page == {}:
-                    for module, page in _pages.PAGE_REGISTRY.items():
-                        if module.split(".")[-1] == "not_found_404":
-                            layout = page["layout"]
-                            title = page["title"]
-                            break
-                    else:
-                        layout = html.H1("404 - Page not found")
-                        title = self.title
-                else:
-                    layout = page.get("layout", "")
-                    title = page["title"]
+                inputs = {
+                    "pathname_": Input(_ID_LOCATION, "pathname"),
+                    "search_": Input(_ID_LOCATION, "search"),
+                }
+                inputs.update(self.routing_callback_inputs)
 
-                if callable(layout):
-                    layout = (
-                        layout(**path_variables, **query_parameters)
-                        if path_variables
-                        else layout(**query_parameters)
-                    )
-                if callable(title):
-                    title = title(**path_variables) if path_variables else title()
-
-                return layout, {"title": title}
-
-            _validate.check_for_duplicate_pathnames(_pages.PAGE_REGISTRY)
-            _validate.validate_registry(_pages.PAGE_REGISTRY)
-
-            # Set validation_layout
-            if not self.config.suppress_callback_exceptions:
-                self.validation_layout = html.Div(
-                    [
-                        page["layout"]() if callable(page["layout"]) else page["layout"]
-                        for page in _pages.PAGE_REGISTRY.values()
-                    ]
-                    + [
-                        # pylint: disable=not-callable
-                        self.layout()
-                        if callable(self.layout)
-                        else self.layout
-                    ]
+                @self.callback(
+                    Output(_ID_CONTENT, "children"),
+                    Output(_ID_STORE, "data"),
+                    inputs=inputs,
+                    prevent_initial_call=True,
+                    hidden=True,
                 )
-                if _ID_CONTENT not in self.validation_layout:
-                    raise Exception("`dash.page_container` not found in the layout")
+                async def update(pathname_, search_, **states):
+                    query_parameters = _parse_query_string(search_)
+                    page, path_variables = _path_to_page(
+                        self.strip_relative_path(pathname_)
+                    )
+                    if page == {}:
+                        for module, page in _pages.PAGE_REGISTRY.items():
+                            if module.split(".")[-1] == "not_found_404":
+                                layout = page["layout"]
+                                title = page["title"]
+                                break
+                        else:
+                            layout = html.H1("404 - Page not found")
+                            title = self.title
+                    else:
+                        layout = page.get("layout", "")
+                        title = page["title"]
 
-            # Update the page title on page navigation
-            self.clientside_callback(
-                """
-                function(data) {{
-                    document.title = data.title
-                }}
-                """,
-                Output(_ID_DUMMY, "children"),
-                Input(_ID_STORE, "data"),
-            )
+                    if callable(layout):
+                        layout = await execute_async_function(
+                            layout,
+                            **{**(path_variables or {}), **query_parameters, **states},
+                        )
+                    if callable(title):
+                        title = await execute_async_function(
+                            title, **{**(path_variables or {})}
+                        )
+                    return layout, {"title": title}
 
-    def run_server(self, *args, **kwargs):
-        """`run_server` is a deprecated alias of `run` and may be removed in a
-        future version. We recommend using `app.run` instead.
+                _validate.check_for_duplicate_pathnames(_pages.PAGE_REGISTRY)
+                _validate.validate_registry(_pages.PAGE_REGISTRY)
 
-        See `app.run` for usage information.
-        """
-        self.run(*args, **kwargs)
+                if not self.config.suppress_callback_exceptions:
+
+                    async def get_layouts():
+                        return [
+                            await execute_async_function(page["layout"])
+                            if callable(page["layout"])
+                            else page["layout"]
+                            for page in _pages.PAGE_REGISTRY.values()
+                        ]
+
+                    layouts = await get_layouts()
+                    # pylint: disable=not-callable
+                    layouts += [self.layout() if callable(self.layout) else self.layout]
+                    self.validation_layout = html.Div(layouts)
+                    if _ID_CONTENT not in self.validation_layout:
+                        raise Exception("`dash.page_container` not found in the layout")
+
+                self.clientside_callback(
+                    """
+                    function(data) {
+                        document.title = data.title
+                    }
+                    """,
+                    Output(_ID_DUMMY, "children"),
+                    Input(_ID_STORE, "data"),
+                    hidden=True,
+                )
+
+                # Publish the flag last so a raced-in task cannot observe it
+                # set while the callback registration above is still pending.
+                self._got_first_request["pages"] = True
+
+        # Sync version
+        def router_sync():
+            if self._got_first_request["pages"]:
+                return
+
+            # Double-checked locking, same rationale as router_async and
+            # _setup_server (gh-3971).
+            with self._pages_lock:
+                if self._got_first_request["pages"]:
+                    return
+
+                inputs = {
+                    "pathname_": Input(_ID_LOCATION, "pathname"),
+                    "search_": Input(_ID_LOCATION, "search"),
+                }
+                inputs.update(self.routing_callback_inputs)
+
+                @self.callback(
+                    Output(_ID_CONTENT, "children"),
+                    Output(_ID_STORE, "data"),
+                    inputs=inputs,
+                    prevent_initial_call=True,
+                    hidden=True,
+                )
+                def update(pathname_, search_, **states):
+                    query_parameters = _parse_query_string(search_)
+                    page, path_variables = _path_to_page(
+                        self.strip_relative_path(pathname_)
+                    )
+                    if page == {}:
+                        for module, page in _pages.PAGE_REGISTRY.items():
+                            if module.split(".")[-1] == "not_found_404":
+                                layout = page["layout"]
+                                title = page["title"]
+                                break
+                        else:
+                            layout = html.H1("404 - Page not found")
+                            title = self.title
+                    else:
+                        layout = page.get("layout", "")
+                        title = page["title"]
+
+                    if callable(layout):
+                        layout = layout(
+                            **{**(path_variables or {}), **query_parameters, **states}
+                        )
+                    if callable(title):
+                        title = title(**(path_variables or {}))
+                    return layout, {"title": title}
+
+                _validate.check_for_duplicate_pathnames(_pages.PAGE_REGISTRY)
+                _validate.validate_registry(_pages.PAGE_REGISTRY)
+
+                if not self.config.suppress_callback_exceptions:
+                    layout = self.layout
+                    if not isinstance(layout, list):
+                        # pylint: disable=not-callable
+                        layout = [
+                            self.layout() if callable(self.layout) else self.layout
+                        ]
+                    self.validation_layout = html.Div(
+                        [
+                            page["layout"]()
+                            if callable(page["layout"])
+                            else page["layout"]
+                            for page in _pages.PAGE_REGISTRY.values()
+                        ]
+                        + layout
+                    )
+                    if _ID_CONTENT not in self.validation_layout:
+                        raise Exception("`dash.page_container` not found in the layout")
+
+                self.clientside_callback(
+                    """
+                    function(data) {
+                        document.title = data.title
+                    }
+                    """,
+                    Output(_ID_DUMMY, "children"),
+                    Input(_ID_STORE, "data"),
+                )
+
+                # Publish the flag last so a raced-in thread cannot observe
+                # it set while the callback registration above is still
+                # pending.
+                self._got_first_request["pages"] = True
+
+        if self._use_async:
+            self.backend.before_request(router_async)
+        else:
+            self.backend.before_request(router_sync)
+
+    def __call__(self, *args, **kwargs):
+        return self.backend.__call__(*args, **kwargs)

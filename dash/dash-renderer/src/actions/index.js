@@ -1,12 +1,18 @@
-import {once} from 'ramda';
+import {once, path} from 'ramda';
 import {createAction} from 'redux-actions';
 import {addRequestedCallbacks} from './callbacks';
 import {getAppState} from '../reducers/constants';
 import {getAction} from './constants';
-import cookie from 'cookie';
+import {parseCookie} from 'cookie';
 import {validateCallbacksToLayout} from './dependencies';
-import {includeObservers, getLayoutCallbacks} from './dependencies_ts';
-import {getPath} from './paths';
+import {
+    includeObservers,
+    getLayoutCallbacks,
+    makeResolvedCallback,
+    resolveDeps
+} from './dependencies_ts';
+import {computePaths, getPath} from './paths';
+import {recordUiEdit} from '../persistence';
 
 export const onError = createAction(getAction('ON_ERROR'));
 export const setAppLifecycle = createAction(getAction('SET_APP_LIFECYCLE'));
@@ -17,7 +23,36 @@ export const setHooks = createAction(getAction('SET_HOOKS'));
 export const setLayout = createAction(getAction('SET_LAYOUT'));
 export const setPaths = createAction(getAction('SET_PATHS'));
 export const setRequestQueue = createAction(getAction('SET_REQUEST_QUEUE'));
-export const updateProps = createAction(getAction('ON_PROP_CHANGE'));
+export const insertComponent = createAction(getAction('INSERT_COMPONENT'));
+export const removeComponent = createAction(getAction('REMOVE_COMPONENT'));
+
+export const onPropChange = createAction(getAction('ON_PROP_CHANGE'));
+export const resetComponentState = createAction(
+    getAction('RESET_COMPONENT_STATE')
+);
+
+export function updateProps(payload) {
+    return (dispatch, getState) => {
+        const component = path(payload.itempath, getState().layout);
+        // The component may no longer exist at this path - eg. an
+        // `ExternalWrapper` (components as props) whose host subtree was
+        // replaced by a callback. Updating props of a component that isn't
+        // in the layout is a no-op and would crash `recordUiEdit`.
+        if (!component) {
+            return;
+        }
+        recordUiEdit(component, payload.props, dispatch);
+        dispatch(onPropChange(payload));
+    };
+}
+
+export const addComponentToLayout = payload => (dispatch, getState) => {
+    const {paths} = getState();
+    dispatch(insertComponent(payload));
+    dispatch(
+        setPaths(computePaths(payload.component, payload.componentPath, paths))
+    );
+};
 
 export const dispatchError = dispatch => (message, lines) =>
     dispatch(
@@ -38,11 +73,16 @@ export function hydrateInitialOutputs() {
 /* eslint-disable-next-line no-console */
 const logWarningOnce = once(console.warn);
 
-export function getCSRFHeader() {
+export function getCSRFHeader(config) {
     try {
-        return {
-            'X-CSRFToken': cookie.parse(document.cookie)._csrf_token
-        };
+        const tokenName = (config && config.csrf_token_name) || '_csrf_token';
+        const headerName = (config && config.csrf_header_name) || 'X-CSRFToken';
+        const cookies = parseCookie(document.cookie);
+        const token = cookies[tokenName];
+        if (!token) {
+            return {};
+        }
+        return {[headerName]: token};
     } catch (e) {
         logWarningOnce(e);
         return {};
@@ -67,13 +107,59 @@ function triggerDefaultState(dispatch, getState) {
         );
     }
 
-    dispatch(
-        addRequestedCallbacks(
-            getLayoutCallbacks(graphs, paths, layout, {
-                outputsOnly: true
-            })
-        )
+    const layoutCallbacks = getLayoutCallbacks(
+        graphs,
+        paths,
+        layout.components,
+        {
+            outputsOnly: true
+        }
     );
+
+    // Also include no-output and no-input callbacks that should fire on initial load
+    const specialCallbacks = (graphs.callbacks || []).reduce((acc, cb) => {
+        if (cb.prevent_initial_call) {
+            return acc;
+        }
+
+        const isNoOutput = cb.noOutput;
+        const isNoInput = !cb.noOutput && cb.inputs.length === 0;
+
+        if (!isNoOutput && !isNoInput) {
+            return acc;
+        }
+
+        const resolved = makeResolvedCallback(cb, resolveDeps(), '');
+        resolved.initialCall = true;
+
+        if (isNoOutput) {
+            // No-output: include if no inputs or any input is in layout
+            if (cb.inputs.length === 0) {
+                acc.push(resolved);
+            } else {
+                const inputs = resolved.getInputs(paths);
+                if (
+                    inputs.some(inp =>
+                        Array.isArray(inp) ? inp.length > 0 : inp
+                    )
+                ) {
+                    acc.push(resolved);
+                }
+            }
+        } else {
+            // No-input: include if any output is in layout
+            const outputs = resolved.getOutputs(paths);
+            if (
+                outputs.some(out => (Array.isArray(out) ? out.length > 0 : out))
+            ) {
+                acc.push(resolved);
+            }
+        }
+
+        return acc;
+    }, []);
+
+    dispatch(addRequestedCallbacks([...layoutCallbacks, ...specialCallbacks]));
 }
 
 export const redo = moveHistory('REDO');

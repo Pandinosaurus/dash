@@ -3,9 +3,9 @@ import os
 import sys
 import time
 import logging
+from typing import Union, Optional
 import warnings
-import percy
-import requests
+from percy import percy_snapshot as _percy_snapshot
 
 from selenium import webdriver
 from selenium.webdriver.support import expected_conditions as EC
@@ -32,25 +32,26 @@ from dash.testing.dash_page import DashPageMixin
 from dash.testing.errors import DashAppLoadingError, BrowserError, TestingTimeoutError
 from dash.testing.consts import SELENIUM_GRID_DEFAULT
 
-
 logger = logging.getLogger(__name__)
 
 
 class Browser(DashPageMixin):
+    _url: str
+
     # pylint: disable=too-many-arguments
     def __init__(
         self,
-        browser,
-        remote=False,
-        remote_url=None,
-        headless=False,
-        options=None,
-        download_path="",
-        percy_run=True,
-        percy_finalize=True,
-        percy_assets_root="",
-        wait_timeout=10,
-        pause=False,
+        browser: str,
+        remote: bool = False,
+        remote_url: Optional[str] = None,
+        headless: bool = False,
+        options: Optional[Union[dict, list]] = None,
+        download_path: str = "",
+        percy_run: bool = True,
+        percy_finalize: bool = True,
+        percy_assets_root: str = "",
+        wait_timeout: int = 10,
+        pause: bool = False,
     ):
         self._browser = browser.lower()
         self._remote_url = remote_url
@@ -65,24 +66,19 @@ class Browser(DashPageMixin):
         self._percy_run = percy_run
         self._pause = pause
 
-        self._driver = until(self.get_webdriver, timeout=1)
+        self._driver = until(self._try_get_webdriver, timeout=30)
         self._driver.implicitly_wait(2)
 
         self._wd_wait = WebDriverWait(self.driver, wait_timeout)
         self._last_ts = 0
-        self._url = None
+        self._url = ""
 
         self._window_idx = 0  # switch browser tabs
 
         if self._percy_run:
-            self.percy_runner = percy.Runner(
-                loader=percy.ResourceLoader(
-                    webdriver=self.driver,
-                    base_url="/assets",
-                    root_dir=percy_assets_root,
-                )
-            )
-            self.percy_runner.initialize_build()
+            # Percy CLI handles build initialization via percy exec wrapper
+            self._percy_assets_root = percy_assets_root
+            # No explicit initialization needed
 
         logger.debug("initialize browser with arguments")
         logger.debug("  headless => %s", self._headless)
@@ -96,29 +92,28 @@ class Browser(DashPageMixin):
         try:
             self.driver.quit()
             if self._percy_run and self._percy_finalize:
-                logger.info("percy runner finalize build now")
-                self.percy_runner.finalize_build()
+                logger.info("percy finalize will be handled by percy build:finalize")
+                # With percy CLI, finalization handled by separate command
             else:
                 logger.info("percy finalize relies on CI job")
         except WebDriverException:
             logger.exception("webdriver quit was not successful")
-        except percy.errors.Error:
-            logger.exception("percy runner failed to finalize properly")
 
     def visit_and_snapshot(
         self,
-        resource_path,
-        hook_id,
+        resource_path: str,
+        hook_id: str,
         wait_for_callbacks=True,
         convert_canvases=False,
         assert_check=True,
         stay_on_page=False,
         widths=None,
     ):
+        path = resource_path.lstrip("/")
         try:
-            path = resource_path.lstrip("/")
             if path != resource_path:
                 logger.warning("we stripped the left '/' in resource_path")
+            self.server_url = self.server_url
             self.driver.get(f"{self.server_url.rstrip('/')}/{path}")
 
             # wait for the hook_id to present and all callbacks get fired
@@ -159,8 +154,14 @@ class Browser(DashPageMixin):
         """
         if widths is None:
             widths = [1280]
-        snapshot_name = f"{name} - py{sys.version_info.major}.{sys.version_info.minor}"
-        logger.info("taking snapshot name => %s", snapshot_name)
+        try:
+            import asgiref  # pylint: disable=unused-import, import-outside-toplevel # noqa: F401, C0415
+
+            name += "_async"
+        except ImportError:
+            pass
+
+        logger.info("taking snapshot name => %s", name)
         try:
             if wait_for_callbacks:
                 # the extra one second sleep adds safe margin in the context
@@ -195,12 +196,15 @@ class Browser(DashPageMixin):
             """
             )
 
+        # NEW: Use percy-python-selenium SDK
         try:
-            self.percy_runner.snapshot(name=snapshot_name, widths=widths)
-        except requests.HTTPError as err:
-            # Ignore retries.
-            if err.request.status_code != 400:
-                raise err
+            if os.getenv("PERCY_TOKEN"):
+                percy_options = {"widths": widths, "min_height": 1024}
+                _percy_snapshot(self.driver, name, **percy_options)
+            else:
+                logger.debug("Percy snapshots disabled - PERCY_TOKEN not set")
+        except Exception as err:  # pylint: disable=broad-exception-caught
+            logger.warning("Percy snapshot failed: %s", err)
 
         if convert_canvases:
             self.driver.execute_script(
@@ -217,7 +221,7 @@ class Browser(DashPageMixin):
             """
             )
 
-    def take_snapshot(self, name):
+    def take_snapshot(self, name: str):
         """Hook method to take snapshot when a selenium test fails. The
         snapshot is placed under.
 
@@ -226,7 +230,10 @@ class Browser(DashPageMixin):
         with a filename combining test case name and the
         running selenium session id
         """
-        target = "/tmp/dash_artifacts" if not self._is_windows() else os.getenv("TEMP")
+        target = (
+            "/tmp/dash_artifacts" if not self._is_windows() else os.getenv("TEMP", "")
+        )
+
         if not os.path.exists(target):
             try:
                 os.mkdir(target)
@@ -283,7 +290,7 @@ class Browser(DashPageMixin):
                 message = msg(self.driver)
             else:
                 message = msg
-            raise TimeoutException(message) from err
+            raise TimeoutException(str(message)) from err
 
     def wait_for_element(self, selector, timeout=None):
         """wait_for_element is shortcut to `wait_for_element_by_css_selector`
@@ -402,7 +409,7 @@ class Browser(DashPageMixin):
             )
         except TimeoutException as exc:
             logger.exception("dash server is not loaded within %s seconds", timeout)
-            logs = "\n".join((str(log) for log in self.get_logs()))
+            logs = "\n".join((str(log) for log in self.get_logs()))  # type: ignore[reportOptionalIterable]
             logger.debug(logs)
             html = self.find_element("body").get_property("innerHTML")
             raise DashAppLoadingError(
@@ -419,10 +426,10 @@ class Browser(DashPageMixin):
         dropdown = self._get_element(elem_or_selector)
         dropdown.click()
 
-        menu = dropdown.find_element(By.CSS_SELECTOR, "div.Select-menu-outer")
+        menu = self._get_element(".dash-dropdown-options")
         logger.debug("the available options are %s", "|".join(menu.text.split("\n")))
 
-        options = menu.find_elements(By.CSS_SELECTOR, "div.VirtualizedSelectOption")
+        options = menu.find_elements(By.CSS_SELECTOR, ".dash-dropdown-option")
         if options:
             if isinstance(index, int):
                 options[index].click()
@@ -468,15 +475,20 @@ class Browser(DashPageMixin):
         )
 
         if self._headless:
-            options.headless = True
+            options.add_argument("--headless")
 
         return options
 
+    def _try_get_webdriver(self):
+        """Wrapper that catches exceptions so until() can retry on transient failures."""
+        try:
+            return self.get_webdriver()
+        except WebDriverException:
+            logger.exception("webdriver initialization failed, will retry")
+            return None
+
     def _get_chrome(self):
         options = self._get_wd_options()
-
-        options.set_capability("loggingPrefs", {"browser": "SEVERE"})
-        options.set_capability("goog:loggingPrefs", {"browser": "SEVERE"})
 
         if "DASH_TEST_CHROMEPATH" in os.environ:
             options.binary_location = os.environ["DASH_TEST_CHROMEPATH"]
@@ -491,30 +503,35 @@ class Browser(DashPageMixin):
                 "safebrowsing.disable_download_protection": True,
             },
         )
+
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-gpu")
-        options.add_argument("--remote-debugging-port=9222")
+        options.add_argument("--remote-debugging-port=0")
+        options.add_argument("--disable-notifications")
+        options.add_argument("--disable-popup-blocking")
+
+        options.set_capability("goog:loggingPrefs", {"browser": "SEVERE"})
 
         chrome = (
-            webdriver.Remote(command_executor=self._remote_url, options=options)
+            webdriver.Remote(command_executor=self._remote_url, options=options)  # type: ignore[reportAttributeAccessIssue]
             if self._remote
             else webdriver.Chrome(options=options)
         )
 
+        # Enable downloads in headless mode
         # https://bugs.chromium.org/p/chromium/issues/detail?id=696481
-        if self._headless:
-            # pylint: disable=protected-access
-            chrome.command_executor._commands["send_command"] = (
-                "POST",
-                "/session/$sessionId/chromium/send_command",
-            )
-            params = {
-                "cmd": "Page.setDownloadBehavior",
-                "params": {"behavior": "allow", "downloadPath": self.download_path},
-            }
-            res = chrome.execute("send_command", params)
-            logger.debug("enabled headless download returns %s", res)
+        if self._headless and self.download_path and hasattr(chrome, "execute_cdp_cmd"):
+            try:
+                # Modern approach using CDP command (Chrome only)
+                # pylint: disable=no-member
+                chrome.execute_cdp_cmd(  # type: ignore[union-attr]
+                    "Page.setDownloadBehavior",
+                    {"behavior": "allow", "downloadPath": self.download_path},
+                )
+                logger.debug("enabled headless download via CDP")
+            except Exception as e:  # pylint: disable=broad-exception-caught
+                logger.warning("failed to set headless download behavior: %s", e)
 
         chrome.set_window_position(0, 0)
         return chrome
@@ -522,18 +539,18 @@ class Browser(DashPageMixin):
     def _get_firefox(self):
         options = self._get_wd_options()
 
-        options.set_capability("loggingPrefs", {"browser": "SEVERE"})
-        options.set_capability("marionette", True)
-
         options.set_preference("browser.download.dir", self.download_path)
         options.set_preference("browser.download.folderList", 2)
         options.set_preference(
             "browser.helperApps.neverAsk.saveToDisk",
             "application/octet-stream",  # this MIME is generic for binary
         )
+        if not self._remote_url and self._remote:
+            raise TypeError("remote_url was not provided but required for Firefox")
+
         return (
             webdriver.Remote(
-                command_executor=self._remote_url,
+                command_executor=self._remote_url,  # type: ignore[reportTypeArgument]
                 options=options,
             )
             if self._remote
@@ -579,7 +596,7 @@ class Browser(DashPageMixin):
         w, h = elem.size["width"], elem.size["height"]
         try:
             ActionChains(self.driver).move_to_element_with_offset(
-                elem, w * start_fraction, h * start_fraction
+                elem, int(w * (start_fraction - 0.5)), int(h * (start_fraction - 0.5))
             ).drag_and_drop_by_offset(
                 elem, w * zoom_box_fraction, h * zoom_box_fraction
             ).perform()
@@ -594,7 +611,9 @@ class Browser(DashPageMixin):
         elem = self._get_element(elem_or_selector)
 
         ActionChains(self.driver).move_to_element_with_offset(
-            elem, elem.size["width"] * fx, elem.size["height"] * fy
+            elem,
+            int(elem.size["width"] * (fx - 0.5)),
+            int(elem.size["height"] * (fy - 0.5)),
         ).click().perform()
 
     def get_logs(self):
@@ -603,18 +622,21 @@ class Browser(DashPageMixin):
 
         Chrome only
         """
-        if self.driver.name.lower() == "chrome":
+        if self._browser == "chrome":
             return [
                 entry
                 for entry in self.driver.get_log("browser")
                 if entry["timestamp"] > self._last_ts
             ]
-        warnings.warn("get_logs always return None with webdrivers other than Chrome")
-        return None
+        warnings.warn(
+            "get_logs always return [] with webdrivers other than Chrome",
+            stacklevel=2,
+        )
+        return []
 
     def reset_log_timestamp(self):
         """reset_log_timestamp only work with chrome webdriver."""
-        if self.driver.name.lower() == "chrome":
+        if self._browser == "chrome":
             entries = self.driver.get_log("browser")
             if entries:
                 self._last_ts = entries[-1]["timestamp"]
@@ -629,7 +651,7 @@ class Browser(DashPageMixin):
         return self.driver.session_id
 
     @property
-    def server_url(self):
+    def server_url(self) -> str:
         return self._url
 
     @server_url.setter

@@ -1,4 +1,5 @@
 import io
+import os
 from setuptools import setup, find_packages
 
 main_ns = {}
@@ -6,7 +7,7 @@ exec(open("dash/version.py", encoding="utf-8").read(), main_ns)  # pylint: disab
 
 
 def read_req_file(req_type):
-    with open(f"requires-{req_type}.txt", encoding="utf-8") as fp:
+    with open(os.path.join("requirements", f"{req_type}.txt"), encoding="utf-8") as fp:
         requires = (line.strip() for line in fp)
         return [req for req in requires if req and not req.startswith("#")]
 
@@ -26,21 +27,28 @@ setup(
     long_description=io.open("README.md", encoding="utf-8").read(),  # pylint: disable=consider-using-with
     long_description_content_type="text/markdown",
     install_requires=read_req_file("install"),
-    python_requires=">=3.6",
+    python_requires=">=3.9",
     extras_require={
+        "async": read_req_file("async"),
         "ci": read_req_file("ci"),
         "dev": read_req_file("dev"),
         "testing": read_req_file("testing"),
         "celery": read_req_file("celery"),
         "diskcache": read_req_file("diskcache"),
-        "compress": read_req_file("compress")
+        "redis": read_req_file("redis"),
+        "compress": read_req_file("compress"),
+        "fastapi": read_req_file("fastapi"),
+        "quart": read_req_file("quart"),
+        "cloud": read_req_file("cloud"),
+        "ag-grid": read_req_file("ag-grid")
     },
     entry_points={
         "console_scripts": [
             "dash-generate-components = "
             "dash.development.component_generator:cli",
             "renderer = dash.development.build_process:renderer",
-            "dash-update-components = dash.development.update_components:cli"
+            "dash-update-components = dash.development.update_components:cli",
+            "plotly = dash._plotly_cli:cli"
         ],
         "pytest11": ["dash = dash.testing.plugin"],
     },
@@ -64,10 +72,10 @@ setup(
         "License :: OSI Approved :: MIT License",
         "Programming Language :: Python",
         "Programming Language :: Python :: 3",
-        "Programming Language :: Python :: 3.6",
-        "Programming Language :: Python :: 3.7",
-        "Programming Language :: Python :: 3.8",
         "Programming Language :: Python :: 3.9",
+        "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
         "Topic :: Database :: Front-Ends",
         "Topic :: Office/Business :: Financial :: Spreadsheet",
         "Topic :: Scientific/Engineering :: Visualization",

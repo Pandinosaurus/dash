@@ -62,14 +62,14 @@ def test_inbs001_all_types(dash_dcc):
 def test_inbs002_user_class(dash_dcc):
     app = Dash(__name__, assets_folder="../../assets")
 
-    app.layout = html.Div(className="test-input-css", children=[dcc.Input()])
+    app.layout = dcc.Input(className="test-input-css")
 
     dash_dcc.start_server(app)
 
     dash_dcc.wait_for_style_to_equal(
-        ".test-input-css input", "borderColor", "rgb(255, 105, 180)"
+        ".test-input-css", "borderColor", "rgb(255, 105, 180)"
     )
-    dash_dcc.wait_for_style_to_equal(".test-input-css input", "width", "420px")
+    dash_dcc.wait_for_style_to_equal(".test-input-css", "width", "420px")
 
     assert dash_dcc.get_logs() == []
 
@@ -97,9 +97,79 @@ def test_inbs003_styles_are_scoped(dash_dcc):
     dash_dcc.start_server(app)
 
     external_input = dash_dcc.find_element("#ExternalInput")
-    dash_input = dash_dcc.find_element(".unittest")
+    dash_input = dash_dcc.find_element("#DashInput")
 
     external_outline_css = external_input.value_of_css_property("outline")
     dash_outline_css = dash_input.value_of_css_property("outline")
 
     assert external_outline_css != dash_outline_css
+
+
+@pytest.mark.parametrize(
+    "initial_text, invalid_char, cursor_position_before, expected_text, expected_cursor_position",
+    [
+        ("abcdddef", "/", 2, "ab/cdddef", 3),
+        ("abcdef", "$", 2, "ab$cdef", 3),
+        ("abcdef", "$", 3, "abc$def", 4),
+        ("abcdef", "A", 4, "abcdAef", 5),  # valid character
+    ],
+)
+def test_inbs004_cursor_position_on_invalid_input(
+    dash_dcc,
+    initial_text,
+    invalid_char,
+    cursor_position_before,
+    expected_text,
+    expected_cursor_position,
+):
+    app = Dash(__name__)
+
+    app.layout = html.Div(
+        [
+            dcc.Input(
+                id="test-input",
+                type="text",
+                placeholder="File name",
+                className="create_file_input",
+                pattern="[a-zA-Z_][a-zA-Z0-9_]*",
+            ),
+            html.Div(id="output"),
+        ]
+    )
+
+    dash_dcc.start_server(app)
+    input_elem = dash_dcc.find_element("#test-input")
+
+    input_elem.send_keys(initial_text)
+    assert (
+        input_elem.get_attribute("value") == initial_text
+    ), "Initial text should match"
+
+    dash_dcc.driver.execute_script(
+        f"""
+        var elem = arguments[0];
+        elem.setSelectionRange({cursor_position_before}, {cursor_position_before});
+        elem.focus();
+    """,
+        input_elem,
+    )
+
+    input_elem.send_keys(invalid_char)
+
+    assert (
+        input_elem.get_attribute("value") == expected_text
+    ), f"Input should be {expected_text}"
+
+    cursor_position = dash_dcc.driver.execute_script(
+        """
+        var elem = arguments[0];
+        return elem.selectionStart;
+    """,
+        input_elem,
+    )
+
+    assert (
+        cursor_position == expected_cursor_position
+    ), f"Cursor should be at position {expected_cursor_position}"
+
+    assert dash_dcc.get_logs() == []

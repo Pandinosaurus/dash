@@ -4,6 +4,7 @@ const NodePolyfillPlugin = require("node-polyfill-webpack-plugin");
 const WebpackDashDynamicImport = require('@plotly/webpack-dash-dynamic-import');
 
 const packagejson = require('./package.json');
+const {jsxRuntimeExternal} = require('../../dash/dash-renderer/jsx-runtime-external');
 
 const dashLibraryName = packagejson.name.replace(/-/g, '_');
 
@@ -33,11 +34,13 @@ module.exports = (env, argv) => {
         filename = `${dashLibraryName}.js`;
     }
 
-    const entry = overrides.entry || { main: './src/index.js' };
+    const entry = overrides.entry || { main: './src/index.ts' };
 
     const externals = ('externals' in overrides) ? overrides.externals : ({
         react: 'React',
         'react-dom': 'ReactDOM',
+        'react/jsx-runtime': jsxRuntimeExternal,
+        'react/jsx-dev-runtime': jsxRuntimeExternal,
         'prop-types': 'PropTypes'
     });
 
@@ -55,9 +58,27 @@ module.exports = (env, argv) => {
             }
         },
         externals,
+        resolve: {
+            extensions: ['.ts', '.tsx', '.js', '.jsx', '.json']
+        },
         module: {
             noParse: /node_modules[\\\/]plotly.js-dist-min/,
             rules: [
+                // TypeScript loader
+                {
+                    test: /\.tsx?$/,
+                    exclude: /node_modules/,
+                    use: {
+                        loader: 'babel-loader',
+                        options: {
+                            presets: [
+                                '@babel/preset-env',
+                                '@babel/preset-react',
+                                '@babel/preset-typescript'
+                            ]
+                        }
+                    }
+                },
                 {
                     test: /\.jsx?$/,
                     exclude: /node_modules/,
@@ -66,20 +87,24 @@ module.exports = (env, argv) => {
                     }
                 },
                 {
-                    test: /\.jsx?$/,
-                    include: /node_modules[\\\/](react-jsx-parser|highlight[.]js|react-markdown|remark-math|is-plain-obj|color|moment|react-dates|react(-virtualized)?-select)[\\\/]/,
+                    test: /\.(jsx?|mjs)$/,
+                    include: /node_modules[\\\/](highlight[.]js|react-markdown|remark-math|is-plain-obj|color|date-fns|@radix-ui|@floating-ui|react-window)[\\\/]/,
                     use: {
                         loader: 'babel-loader',
                         options: {
                             babelrc: false,
                             configFile: false,
                             presets: [
-                                '@babel/preset-env'
+                                ['@babel/preset-env', {
+                                    targets: {
+                                        browsers: ['last 10 years and not dead']
+                                    },
+                                    modules: false
+                                }]
                             ]
                         }
                     }
                 },
-
                 {
                     test: /\.css$/,
                     use: [

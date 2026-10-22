@@ -1,4 +1,4 @@
-from dash import Dash, html, dcc
+from dash import Dash, html, dcc, callback, Output, Input, State
 
 import dash.testing.wait as wait
 import time
@@ -52,5 +52,84 @@ def test_clp002_clipboard_text(dash_dcc_headed):
     wait.until(
         lambda: dash_dcc_headed.find_element("#paste").get_attribute("value")
         == copy_text,
+        timeout=3,
+    )
+
+
+def test_clp003_clipboard_text(dash_dcc_headed):
+    copy_text = "Copy this text to the clipboard using a separate button"
+    app = Dash(__name__, prevent_initial_callbacks=True)
+    app.layout = html.Div(
+        [
+            dcc.Clipboard(id="copy_icon", content=copy_text, n_clicks=0),
+            dcc.Textarea(id="paste"),
+            html.Button("Copy", id="copy_button", n_clicks=0),
+        ]
+    )
+
+    @callback(
+        Output("copy_icon", "n_clicks"),
+        State("copy_icon", "n_clicks"),
+        Input("copy_button", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def selected(icon_clicks, button_clicks):
+        return icon_clicks + 1
+
+    dash_dcc_headed.start_server(app)
+
+    dash_dcc_headed.find_element("#copy_button").click()
+    time.sleep(1)
+    dash_dcc_headed.find_element("#paste").click()
+    ActionChains(dash_dcc_headed.driver).key_down(Keys.CONTROL).send_keys("v").key_up(
+        Keys.CONTROL
+    ).perform()
+
+    wait.until(
+        lambda: dash_dcc_headed.find_element("#paste").get_attribute("value")
+        == copy_text,
+        timeout=3,
+    )
+
+
+def test_clp004_clipboard_children_and_copied_children(dash_dcc_headed):
+    content = "https://dash.plotly.com/"
+    children_text = "Copy URL"
+    copied_children_text = "Copied!"
+
+    app = Dash(__name__, prevent_initial_callbacks=True)
+    app.layout = html.Div(
+        [
+            dcc.Clipboard(
+                id="clipboard",
+                children=children_text,
+                copied_children=copied_children_text,
+                content=content,
+            ),
+            dcc.Textarea(id="textarea"),
+        ]
+    )
+
+    dash_dcc_headed.start_server(app)
+
+    clipboard = dash_dcc_headed.find_element("#clipboard")
+
+    assert clipboard.text == children_text
+
+    clipboard.click()
+    wait.until(
+        lambda: dash_dcc_headed.find_element("#clipboard").text == copied_children_text,
+        timeout=3,
+    )
+    textarea = dash_dcc_headed.find_element("#textarea")
+    textarea.click()
+
+    ActionChains(dash_dcc_headed.driver).key_down(Keys.CONTROL).send_keys("v").key_up(
+        Keys.CONTROL
+    ).perform()
+
+    wait.until(
+        lambda: dash_dcc_headed.find_element("#textarea").get_attribute("value")
+        == content,
         timeout=3,
     )

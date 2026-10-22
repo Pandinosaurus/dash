@@ -70,6 +70,8 @@ import {createAction} from 'redux-actions';
 
 import Registry from './registry';
 import {stringifyId} from './actions/dependencies';
+import {isUntouchedByPatch} from './actions/patchAnalysis';
+import {isDryComponent} from './wrapper/wrapping';
 
 export const storePrefix = '_dash_persistence.';
 
@@ -290,7 +292,9 @@ const getProps = layout => {
     const {id, persistence} = props;
 
     const element = Registry.resolve(layout);
-    const getVal = prop => props[prop] || (element.defaultProps || {})[prop];
+    const getVal = prop =>
+        props[prop] ||
+        (element.defaultProps || element.dashPersistence || {})[prop];
     const persisted_props = getVal('persisted_props');
     const persistence_type = getVal('persistence_type');
     const canPersist = id && persisted_props && persistence_type;
@@ -316,7 +320,14 @@ export function recordUiEdit(layout, newProps, dispatch) {
         persisted_props,
         persistence_type
     } = getProps(layout);
-    if (!canPersist || !persistence) {
+
+    // if the "persistence" property is changed as a callback output,
+    // skip the persistence storage overwriting.
+    const isPersistenceMismatch =
+        newProps?.persistence !== undefined &&
+        newProps.persistence !== persistence;
+
+    if (!canPersist || !persistence || isPersistenceMismatch) {
         return;
     }
 
@@ -350,13 +361,19 @@ export function recordUiEdit(layout, newProps, dispatch) {
 /*
  * Used for entire layouts (on load) or partial layouts (from children
  * callbacks) to apply previously-stored UI edits to components
+ *
+ * `patchAnalysis` (optional) describes what the `Patch()` that produced this
+ * layout changed
  */
-export function applyPersistence(layout, dispatch) {
-    if (type(layout) !== 'Object' || !layout.props) {
-        return layout;
+export function applyPersistence(layout, dispatch, patchAnalysis) {
+    if (Array.isArray(layout)) {
+        return layout.map(lay =>
+            isDryComponent(lay)
+                ? persistenceMods(lay, lay, [], dispatch, patchAnalysis)
+                : lay
+        );
     }
-
-    return persistenceMods(layout, layout, [], dispatch);
+    return persistenceMods(layout, layout, [], dispatch, patchAnalysis);
 }
 
 const UNDO = true;
@@ -381,7 +398,7 @@ function modProp(key, storage, element, props, persistedProp, update, undo) {
     }
 }
 
-function persistenceMods(layout, component, path, dispatch) {
+function persistenceMods(layout, component, treePath, dispatch, patchAnalysis) {
     const {
         canPersist,
         id,
@@ -393,7 +410,18 @@ function persistenceMods(layout, component, path, dispatch) {
     } = getProps(component);
 
     let layoutOut = layout;
-    if (canPersist && persistence) {
+
+    // Skip the components a Patch carried over from the previous layout
+    // untouched. The patch itself tells us which
+    // components it created and which props it wrote
+    // Note that a component rebuilt with an id that was already in use is
+    // not carried over. It comes with the server's default value, so its
+    // persisted edit must be restored
+    const carriedOver = patchAnalysis
+        ? isUntouchedByPatch(patchAnalysis, id && stringifyId(id))
+        : false;
+
+    if (canPersist && persistence && !carriedOver) {
         const storage = getStore(persistence_type, dispatch);
         const update = {};
         forEach(
@@ -411,7 +439,7 @@ function persistenceMods(layout, component, path, dispatch) {
 
         for (const propName in update) {
             layoutOut = set(
-                lensPath(path.concat('props', propName)),
+                lensPath(treePath.concat('props', propName)),
                 update[propName],
                 layoutOut
             );
@@ -426,8 +454,9 @@ function persistenceMods(layout, component, path, dispatch) {
                 layoutOut = persistenceMods(
                     layoutOut,
                     child,
-                    path.concat('props', 'children', i),
-                    dispatch
+                    treePath.concat('props', 'children', i),
+                    dispatch,
+                    patchAnalysis
                 );
             }
         });
@@ -435,8 +464,9 @@ function persistenceMods(layout, component, path, dispatch) {
         layoutOut = persistenceMods(
             layoutOut,
             children,
-            path.concat('props', 'children'),
-            dispatch
+            treePath.concat('props', 'children'),
+            dispatch,
+            patchAnalysis
         );
     }
     return layoutOut;
@@ -499,46 +529,21 @@ export function prunePersistence(layout, newProps, dispatch) {
         depersistedProps = mergeRight(props, update);
     }
 
-    if (finalPersistence) {
+    if (finalPersistence && persistenceChanged) {
         const finalStorage = getStore(finalPersistenceType, dispatch);
-
-        if (persistenceChanged) {
-            // apply new persistence
-            forEach(
-                persistedProp =>
-                    modProp(
-                        getValsKey(id, persistedProp, finalPersistence),
-                        finalStorage,
-                        element,
-                        depersistedProps,
-                        persistedProp,
-                        update
-                    ),
-                filter(notInNewProps, finalPersistedProps)
-            );
-        }
-
-        // now the main point - clear any edit of a prop that changed
-        // note that this is independent of the new prop value.
-        const transforms = element.persistenceTransforms || {};
-        for (const propName in newProps) {
-            const propTransforms = transforms[propName];
-            if (propTransforms) {
-                for (const propPart in propTransforms) {
-                    finalStorage.removeItem(
-                        getValsKey(
-                            id,
-                            `${propName}.${propPart}`,
-                            finalPersistence
-                        )
-                    );
-                }
-            } else {
-                finalStorage.removeItem(
-                    getValsKey(id, propName, finalPersistence)
-                );
-            }
-        }
+        // apply new persistence
+        forEach(
+            persistedProp =>
+                modProp(
+                    getValsKey(id, persistedProp, finalPersistence),
+                    finalStorage,
+                    element,
+                    depersistedProps,
+                    persistedProp,
+                    update
+                ),
+            filter(notInNewProps, finalPersistedProps)
+        );
     }
     return persistenceChanged ? mergeRight(newProps, update) : newProps;
 }

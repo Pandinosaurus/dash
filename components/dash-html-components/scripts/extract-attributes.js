@@ -2,7 +2,6 @@
 
 const fs = require('fs');
 const cheerio = require('cheerio');
-const request = require('request');
 const str = require('string');
 
 const htmlURL = 'https://developer.mozilla.org/en-US/docs/Web/HTML/Attributes';
@@ -24,12 +23,25 @@ const supportedAttributes = ['accept', 'accessKey', 'action', 'allow',
 'keyParams', 'keyType', 'kind', 'label', 'lang', 'list', 'loop', 'low',
 'manifest', 'marginHeight', 'marginWidth', 'max', 'maxLength', 'media',
 'mediaGroup', 'method', 'min', 'minLength', 'multiple', 'muted', 'name',
-'noValidate', 'nonce', 'open', 'optimum', 'pattern', 'placeholder', 'poster',
+'noValidate', 'nonce', 'open', 'optimum', 'pattern', 'placeholder', 'playsInline', 'poster',
 'preload', 'profile', 'radioGroup', 'readOnly', 'referrerPolicy', 'rel', 'required',
 'reversed', 'role', 'rowSpan', 'rows', 'sandbox', 'scope', 'scoped', 'scrolling',
 'seamless', 'selected', 'shape', 'size', 'sizes', 'span', 'spellCheck', 'src',
 'srcDoc', 'srcLang', 'srcSet', 'start', 'step', 'style', 'summary', 'tabIndex',
 'target', 'title', 'type', 'useMap', 'value', 'width', 'wmode', 'wrap'];
+
+
+const hardcodedAttributes = {
+    autoFocus: {
+        elements: [
+            "button",
+            "input",
+            "select",
+            "textarea"
+        ],
+        description: "The element should be automatically focused after the page loaded."
+    }
+}
 
 // Create a map of HTML attribute to React prop
 // e.g. {"datetime": "dateTime"}
@@ -58,7 +70,7 @@ function extractAttributes($) {
     if($table.length !== 1) {
         throw new Error('page structure changed at ' + htmlURL);
     }
-    const attributes = {};
+    const attributes = hardcodedAttributes;
 
     $table.find('tbody tr').each((i, row) => {
         const $children = cheerio(row).find('td');
@@ -123,24 +135,31 @@ function extractElements(attributes) {
 
 // A local copy of the MDN attributes web page has been saved for reference:
 // fs.readFile('./data/attributes.html', 'utf-8', (error, html) => {
-request(htmlURL, (error, response, html) => {
-    if (error) {
+fetch(htmlURL)
+    .then(response => {
+        if (!response.ok) {
+            throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        return response.text();
+    })
+    .then(html => {
+        const html2 = html.split(/\n\r|\r\n|\r|\n/).map(l => l.trimRight()).join('\n');
+        // write back to the saved copy of MDN attributes so we can see the diff
+        fs.writeFileSync(htmlPath, html2);
+
+        const $ = cheerio.load(html);
+        const attributes = extractAttributes($);
+        const elements = extractElements(attributes);
+        const out = {
+            attributes,
+            elements
+        };
+
+        // Print out JSON with 4-space indentation formatting.
+        // http://stackoverflow.com/a/11276104
+        const tabWidth = 4;
+        fs.writeFileSync(dataPath, JSON.stringify(out, null, tabWidth));
+    })
+    .catch(error => {
         throw error;
-    }
-    const html2 = html.split(/\n\r|\r\n|\r|\n/).map(l => l.trimRight()).join('\n');
-    // write back to the saved copy of MDN attributes so we can see the diff
-    fs.writeFileSync(htmlPath, html2);
-
-    const $ = cheerio.load(html);
-    const attributes = extractAttributes($);
-    const elements = extractElements(attributes);
-    const out = {
-        attributes,
-        elements
-    };
-
-    // Print out JSON with 4-space indentation formatting.
-    // http://stackoverflow.com/a/11276104
-    const tabWidth = 4;
-    fs.writeFileSync(dataPath, JSON.stringify(out, null, tabWidth));
-});
+    });

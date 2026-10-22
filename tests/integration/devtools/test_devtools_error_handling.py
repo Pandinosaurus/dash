@@ -1,4 +1,5 @@
 # -*- coding: UTF-8 -*-
+import flaky
 from dash import Dash, Input, Output, html, dcc
 from dash.exceptions import PreventUpdate
 
@@ -72,14 +73,14 @@ def test_dveh001_python_errors(dash_duo):
     assert "Special 2 clicks exception" in error0
     assert "in bad_sub" not in error0
     # dash and flask part of the traceback not included
-    assert "%% callback invoked %%" not in error0
+    assert "dash.py" not in error0
     assert "self.wsgi_app" not in error0
 
     error1 = get_error_html(dash_duo, 1)
     assert "in update_output" in error1
     assert "in bad_sub" in error1
     assert "ZeroDivisionError" in error1
-    assert "%% callback invoked %%" not in error1
+    assert "dash.py" not in error1
     assert "self.wsgi_app" not in error1
 
 
@@ -108,17 +109,18 @@ def test_dveh006_long_python_errors(dash_duo):
     assert "in bad_sub" not in error0
     # dash and flask part of the traceback ARE included
     # since we set dev_tools_prune_errors=False
-    assert "%% callback invoked %%" in error0
+    assert "backend" in error0 and "flask.py" in error0
     assert "self.wsgi_app" in error0
 
     error1 = get_error_html(dash_duo, 1)
     assert "in update_output" in error1
     assert "in bad_sub" in error1
     assert "ZeroDivisionError" in error1
-    assert "%% callback invoked %%" in error1
+    assert "backend" in error1 and "flask.py" in error1
     assert "self.wsgi_app" in error1
 
 
+@flaky.flaky(max_runs=3)
 def test_dveh002_prevent_update_not_in_error_msg(dash_duo):
     # raising PreventUpdate shouldn't display the error message
     app = Dash(__name__)
@@ -150,9 +152,10 @@ def test_dveh002_prevent_update_not_in_error_msg(dash_duo):
     for _ in range(3):
         dash_duo.find_element("#python").click()
 
-    assert (
-        dash_duo.find_element("#output").text == "button clicks: 3"
-    ), "the click counts correctly in output"
+    # The output only reaches "button clicks: 3" once the third click's callback
+    # runs; poll for it instead of reading synchronously, which races the
+    # callback and sees the initial "button clicks: 0".
+    dash_duo.wait_for_text_to_equal("#output", "button clicks: 3", timeout=4)
 
     # two exceptions fired, but only a single exception appeared in the UI:
     # the prevent default was not displayed

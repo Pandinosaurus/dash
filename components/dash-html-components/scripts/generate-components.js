@@ -32,6 +32,7 @@ const BOOLEAN_PROPERTIES = [
     'noModule',
     'noValidate',
     'open',
+    'playsInline',
     'readonly',
     'required',
     'reversed',
@@ -56,7 +57,8 @@ const NUMERIC_PROPERTIES = [
     'cols',
     'colSpan',
     'size',
-    'step'
+    'step',
+    'tabIndex'
 ];
 
 const PROP_TYPES = {
@@ -176,24 +178,6 @@ function generatePropTypes(element, attributes) {
         }, '') + `
 
     /**
-     * Object that holds the loading state object coming from dash-renderer
-     */
-    'loading_state': PropTypes.shape({
-        /**
-         * Determines if the component is loading or not
-         */
-        is_loading: PropTypes.bool,
-        /**
-         * Holds which property is loading
-         */
-        prop_name: PropTypes.string,
-        /**
-         * Holds the name of the component that is loading
-         */
-        component_name: PropTypes.string,
-    }),
-
-    /**
      * Dash-assigned callback that gets fired when the element is clicked.
      */
     'setProps': PropTypes.func`
@@ -249,49 +233,82 @@ const customDocs = {
  * <body>.`
 };
 
+const customImportsForComponents = {};
+
+function createXSSProtection(propName) {
+    return `
+    const cleanUrl = window.dash_clientside.clean_url;
+    const ${propName} = React.useMemo(() => props.${propName} && cleanUrl(props.${propName}), [props.${propName}]);
+    
+    if (${propName}) {
+        extraProps.${propName} = ${propName};
+    }
+    
+    React.useEffect(() => {
+        if (${propName} && ${propName} !== props.${propName}) {
+            props.setProps({_dash_error: new Error(\`Dangerous link detected: \${props.${propName}}\`)})
+        }
+    }, [props.${propName}, ${propName}]);
+    `
+}
+
+
+const customCodesForComponents = {
+    a: createXSSProtection('href'),
+    form: createXSSProtection('action'),
+    iframe: createXSSProtection('src'),
+    object: createXSSProtection('data'),
+    embed: createXSSProtection('src'),
+    button: createXSSProtection('formAction'),
+    area: createXSSProtection('href'),
+    base: createXSSProtection('href')
+}
+
 function generateComponent(Component, element, attributes) {
     const propTypes = generatePropTypes(element, attributes);
 
+    const customImport = customImportsForComponents[element] || '';
     const customDoc = customDocs[element] ? ('\n *' + customDocs[element] + '\n *') : '';
+
+    const customCode = customCodesForComponents[element] || '';
 
     return `
 import React from 'react';
 import PropTypes from 'prop-types';
 import {omit} from 'ramda';
+${customImport}
 
 /**
  * ${Component} is a wrapper for the <${element}> HTML5 element.${customDoc}
  * For detailed attribute info see:
  * https://developer.mozilla.org/en-US/docs/Web/HTML/Element/${element}
  */
-const ${Component} = (props) => {
-    const dataAttributes = {};
-    if(props.loading_state && props.loading_state.is_loading) {
-        dataAttributes['data-dash-is-loading'] = true;
+const ${Component} = ({n_clicks = 0, n_clicks_timestamp = -1, ...props}) => {
+    const extraProps = {};
+    const ctx = window.dash_component_api.useDashContext();
+    const loading = ctx.useLoading();
+    if (loading) {
+        extraProps['data-dash-is-loading'] = true;
     }
-
+${customCode}
      /* remove unnecessary onClick event listeners  */
     const isStatic = props.disable_n_clicks || !props.id;
     return (
         <${element}
             {...(!isStatic && {onClick:
             () => props.setProps({
-                n_clicks: props.n_clicks + 1,
+                n_clicks: n_clicks + 1,
                 n_clicks_timestamp: Date.now()
             })
             })}
             {...omit(['n_clicks', 'n_clicks_timestamp', 'loading_state', 'setProps', 'disable_n_clicks'], props)}
-            {...dataAttributes}
+            {...extraProps}
         >
             {props.children}
         </${element}>
     );
 };
 
-${Component}.defaultProps = {
-    n_clicks: 0,
-    n_clicks_timestamp: -1,
-};
 
 ${Component}.propTypes = {${propTypes}
 };
@@ -340,6 +357,7 @@ if (!listPath) {
 const list = fs
     .readFileSync(listPath, 'utf8')
     .split('\n')
+    .map(item => item.trim())
     .filter(item => Boolean(item));
 
 // Get the mapping of attributes to elements
